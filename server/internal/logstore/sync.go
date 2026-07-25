@@ -69,18 +69,20 @@ func (s *Store) syncLoop(ctx context.Context, source func() Engine) {
 // generations have been read, which are being read, how many times reading them
 // has failed, and which dropped-line gap the current read is healing.
 type backfillTracker struct {
-	attempts map[genKey]int
-	done     map[genKey]bool
-	inFlight map[genKey]bool
-	healing  map[genKey]int64
+	attempts   map[genKey]int
+	done       map[genKey]bool
+	inFlight   map[genKey]bool
+	healing    map[genKey]gapMark
+	refreshing map[genKey]uint64
 }
 
 func newBackfillTracker() *backfillTracker {
 	return &backfillTracker{
-		attempts: make(map[genKey]int),
-		done:     make(map[genKey]bool),
-		inFlight: make(map[genKey]bool),
-		healing:  make(map[genKey]int64),
+		attempts:   make(map[genKey]int),
+		done:       make(map[genKey]bool),
+		inFlight:   make(map[genKey]bool),
+		healing:    make(map[genKey]gapMark),
+		refreshing: make(map[genKey]uint64),
 	}
 }
 
@@ -88,8 +90,11 @@ func newBackfillTracker() *backfillTracker {
 // is read once; a fresh dropped-line gap makes it eligible again with a fresh
 // retry budget, so a spent budget can never block gap healing.
 func (t *backfillTracker) schedule(s *Store, key genKey, excluded bool) bool {
-	if gap := s.gapAt(key); gap != 0 && gap != t.healing[key] {
-		t.healing[key] = gap
+	gap := s.gapSnapshot(key)
+	refresh := s.refreshAt(key)
+	newGap := gap.version != 0 && gap.version != t.healing[key].version
+	newRefresh := refresh != 0 && refresh != t.refreshing[key]
+	if newGap || newRefresh {
 		delete(t.done, key)
 		delete(t.attempts, key)
 	}
@@ -97,6 +102,12 @@ func (t *backfillTracker) schedule(s *Store, key genKey, excluded bool) bool {
 		return false
 	}
 	t.inFlight[key] = true
+	if gap.version != 0 {
+		t.healing[key] = gap
+	}
+	if refresh != 0 {
+		t.refreshing[key] = refresh
+	}
 	return true
 }
 
@@ -106,9 +117,13 @@ func (t *backfillTracker) complete(s *Store, key genKey) {
 	t.done[key] = true
 	delete(t.attempts, key)
 	s.clearResume(key)
-	if healed := t.healing[key]; healed != 0 {
+	if healed := t.healing[key]; healed.version != 0 {
 		s.clearGap(key, healed)
 		delete(t.healing, key)
+	}
+	if refreshed := t.refreshing[key]; refreshed != 0 {
+		s.clearRefresh(key, refreshed)
+		delete(t.refreshing, key)
 	}
 }
 

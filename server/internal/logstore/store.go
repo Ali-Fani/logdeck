@@ -59,6 +59,19 @@ type Hub interface {
 	Subscribe(spec logstream.ContainerSpec, opts models.LogOptions, sink func(logstream.Record)) func()
 }
 
+// RecoverableHub is implemented by the production logstream hub. Keeping it
+// separate from Hub preserves simple test and alert subscribers while letting
+// the store request engine rereads for upstream buffer loss and lifecycle
+// boundaries.
+type RecoverableHub interface {
+	SubscribeRecoverable(
+		spec logstream.ContainerSpec,
+		opts models.LogOptions,
+		sink func(logstream.Record),
+		recover func(logstream.RecoveryHint),
+	) func()
+}
+
 // Engine is the slice of *docker.MultiHostClient the store needs: container
 // listings for lifecycle tracking and a callback tail for backfill.
 type Engine interface {
@@ -104,10 +117,14 @@ type Store struct {
 	// resume holds every generation's persisted backfill resume point as it
 	// stood before live ingestion started; see snapshotResume.
 	resume map[genKey]resumePoint
-	// gaps holds, per generation, the earliest timestamp the sink had to drop.
-	// The sync loop re-reads the engine from there, so a full ingest buffer
-	// costs latency rather than history.
-	gaps map[genKey]int64
+	// gaps holds, per generation, the earliest timestamp a bounded buffer had
+	// to drop. Its version changes on every notice, even when the timestamp is
+	// identical, so a loss during an in-flight reread cannot be cleared by that
+	// older read completing.
+	gaps map[genKey]gapMark
+	// refresh is the versioned lifecycle-boundary signal. A zero-timestamp
+	// recovery hint rereads from the durable watermark.
+	refresh map[genKey]uint64
 	// invalidated holds the generations DeleteContainer removed, until the
 	// writer has dropped them from its ref cache. See DeleteContainer.
 	invalidated map[genKey]struct{}
@@ -200,7 +217,8 @@ func Open(path string, limits Limits) (*Store, error) {
 		ingestCh:    make(chan ingestMsg, ingestBuffer),
 		retainCh:    make(chan struct{}, 1),
 		resume:      make(map[genKey]resumePoint),
-		gaps:        make(map[genKey]int64),
+		gaps:        make(map[genKey]gapMark),
+		refresh:     make(map[genKey]uint64),
 		invalidated: make(map[genKey]struct{}),
 		backfillSem: make(chan struct{}, maxConcurrentBackfills),
 	}, nil
@@ -223,11 +241,17 @@ func (s *Store) start(ctx context.Context, hub Hub, source func() Engine) {
 
 	// The hub sink is a producer: it must stop before ingestCh is closed.
 	s.producers.Add(1)
-	unsubscribe := hub.Subscribe(
-		logstream.ContainerSpec{}, // all containers on all hosts
-		models.LogOptions{Follow: true, Timestamps: true, Tail: "0", ShowStdout: true, ShowStderr: true},
-		s.sink,
-	)
+	spec := logstream.ContainerSpec{} // all containers on all hosts
+	opts := models.LogOptions{
+		Follow: true, Timestamps: true, Tail: "0",
+		ShowStdout: true, ShowStderr: true,
+	}
+	var unsubscribe func()
+	if recoverable, ok := hub.(RecoverableHub); ok {
+		unsubscribe = recoverable.SubscribeRecoverable(spec, opts, s.sink, s.recover)
+	} else {
+		unsubscribe = hub.Subscribe(spec, opts, s.sink)
+	}
 
 	s.workers.Add(1)
 	go func() {
@@ -295,6 +319,15 @@ func (s *Store) sink(rec logstream.Record) {
 	}
 }
 
+func (s *Store) recover(hint logstream.RecoveryHint) {
+	key := genKey{host: hint.Host, id: hint.ContainerID}
+	if hint.Earliest.IsZero() {
+		s.markRefresh(key)
+		return
+	}
+	s.markGap(key, hint.Earliest.UnixNano())
+}
+
 // resumePoint is one generation's persisted per-stream backfill watermarks.
 type resumePoint struct {
 	stdoutWM    int64
@@ -357,29 +390,64 @@ func (s *Store) clearResume(key genKey) {
 	delete(s.resume, key)
 }
 
-// markGap records the earliest dropped timestamp for a generation.
+type gapMark struct {
+	from    int64
+	version uint64
+}
+
+// markGap records the earliest dropped timestamp for a generation and advances
+// the notice version even if a repeated line has the same timestamp.
 func (s *Store) markGap(key genKey, tsNS int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if from, ok := s.gaps[key]; !ok || tsNS < from {
-		s.gaps[key] = tsNS
+	mark := s.gaps[key]
+	mark.version++
+	if mark.from == 0 || tsNS < mark.from {
+		mark.from = tsNS
 	}
+	s.gaps[key] = mark
 }
 
 // gapAt reports the generation's outstanding gap, or 0 when it has none.
 func (s *Store) gapAt(key genKey) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.gaps[key].from
+}
+
+func (s *Store) gapSnapshot(key genKey) gapMark {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.gaps[key]
 }
 
-// clearGap retires a healed gap, unless an even older line was dropped while
-// the backfill was running.
-func (s *Store) clearGap(key genKey, healed int64) {
+// clearGap retires only the exact notice version a backfill captured. A new
+// drop during that read remains pending even when it has the same timestamp.
+func (s *Store) clearGap(key genKey, healed gapMark) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.gaps[key] == healed {
+	if s.gaps[key].version == healed.version {
 		delete(s.gaps, key)
+	}
+}
+
+func (s *Store) markRefresh(key genKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refresh[key]++
+}
+
+func (s *Store) refreshAt(key genKey) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refresh[key]
+}
+
+func (s *Store) clearRefresh(key genKey, healed uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.refresh[key] == healed {
+		delete(s.refresh, key)
 	}
 }
 
