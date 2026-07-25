@@ -8,7 +8,7 @@ import (
 
 // schemaVersion is the current schema generation, tracked in PRAGMA
 // user_version. Bump it and add a migration step when the schema changes.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // schemaV1 is the initial schema.
 //
@@ -74,6 +74,19 @@ ALTER TABLE log_lines_v2 RENAME TO log_lines;
 CREATE INDEX log_lines_container_ts ON log_lines(container_ref, ts_ns);
 `
 
+// schemaV3 distinguishes generations whose engine history has been read at
+// least once from generations known only through live ingestion. Without this
+// durable bit, a live line can advance the watermark before the first
+// lifecycle sync and make that first backfill skip earlier retained records.
+//
+// Existing rows deliberately migrate as incomplete. They are re-read once
+// from container creation after upgrade; the insert deduplication makes that
+// safe, and a one-time extra read is preferable to preserving an unknown gap.
+const schemaV3 = `
+ALTER TABLE containers
+ADD COLUMN initial_backfill_done INTEGER NOT NULL DEFAULT 0;
+`
+
 // initSchema creates the schema on a fresh database and is a no-op on an
 // already-current one. Unknown (newer) versions are rejected rather than
 // silently downgraded. A fresh database walks the same migration path as an
@@ -105,6 +118,11 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 	if version < 2 {
 		if _, err := tx.ExecContext(ctx, schemaV2); err != nil {
 			return fmt.Errorf("migrate schema to version 2: %w", err)
+		}
+	}
+	if version < 3 {
+		if _, err := tx.ExecContext(ctx, schemaV3); err != nil {
+			return fmt.Errorf("migrate schema to version 3: %w", err)
 		}
 	}
 

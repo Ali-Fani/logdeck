@@ -90,7 +90,13 @@ func (s *Store) backfill(ctx context.Context, engine Engine, info models.Contain
 	})
 
 	excluded := unreadableDriverErr(tailErr)
-	done := ingestMsg{kind: msgDone, key: key, name: name, project: project}
+	done := ingestMsg{
+		kind:     msgDone,
+		key:      key,
+		name:     name,
+		project:  project,
+		complete: tailErr == nil,
+	}
 	if excluded {
 		done.reason = tailErr.Error()
 	}
@@ -117,18 +123,23 @@ func (s *Store) backfill(ctx context.Context, engine Engine, info models.Contain
 func (s *Store) backfillSince(ctx context.Context, key genKey, createdUnix int64) (string, error) {
 	point, ok := s.takeResume(key)
 	if !ok {
+		var initialDone int
 		err := s.db.QueryRowContext(ctx,
-			"SELECT stdout_wm_ns, stderr_wm_ns FROM containers WHERE host = ? AND container_id = ?",
+			`SELECT stdout_wm_ns, stderr_wm_ns, initial_backfill_done
+			 FROM containers WHERE host = ? AND container_id = ?`,
 			key.host, key.id,
-		).Scan(&point.stdoutWM, &point.stderrWM)
+		).Scan(&point.stdoutWM, &point.stderrWM, &initialDone)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return "", err
 		}
+		point.initialDone = initialDone != 0
 	}
 
 	since := time.Unix(createdUnix, 0)
-	if wm := watermark(point.stdoutWM, point.stderrWM); wm != 0 {
-		since = time.Unix(0, wm).Add(-backfillOverlap)
+	if point.initialDone {
+		if wm := watermark(point.stdoutWM, point.stderrWM); wm != 0 {
+			since = time.Unix(0, wm).Add(-backfillOverlap)
+		}
 	}
 	if gap := s.gapAt(key); gap != 0 {
 		if from := time.Unix(0, gap).Add(-backfillOverlap); from.Before(since) {

@@ -66,6 +66,20 @@ func writeEntries(t *testing.T, s *Store, key genKey, name string, entries ...mo
 	}
 }
 
+// markInitialBackfillDone models the ordered completion marker the writer
+// commits after every record from a successful engine read.
+func markInitialBackfillDone(t *testing.T, s *Store, key genKey, name string) {
+	t.Helper()
+	if err := s.commit([]ingestMsg{{
+		kind:     msgDone,
+		key:      key,
+		name:     name,
+		complete: true,
+	}}, map[genKey]int64{}); err != nil {
+		t.Fatalf("mark initial backfill done: %v", err)
+	}
+}
+
 func markRemoved(t *testing.T, s *Store, key genKey) {
 	t.Helper()
 	if _, err := s.db.Exec(
@@ -253,6 +267,7 @@ func TestWatermarkMath(t *testing.T) {
 		entryAt(baseTime.Add(5*time.Second), "stdout", "out 2"),
 		entryAt(baseTime.Add(time.Second), "stderr", "err 1"),
 	)
+	markInitialBackfillDone(t, store, key, "web")
 
 	var stdoutWM, stderrWM int64
 	if err := store.db.QueryRow(
@@ -678,6 +693,7 @@ func TestBackfillDedupAtBoundary(t *testing.T) {
 		entryAt(baseTime.Add(time.Second), "stderr", "line 2 on stderr"),
 	}
 	writeEntries(t, store, key, "web", stored...)
+	markInitialBackfillDone(t, store, key, "web")
 
 	engine := newFakeEngine(containerInfo("local", "aaa", "web", baseTime.Add(-time.Minute)))
 	// The engine re-emits everything from the requested "since", which overlaps
@@ -755,6 +771,16 @@ func TestNewGenerationBackfillsFromCreation(t *testing.T) {
 	if since := engine.opts("aaa").Since; since != created.UTC().Format(time.RFC3339Nano) {
 		t.Fatalf("Since = %s, want container creation time %s", since, created.UTC().Format(time.RFC3339Nano))
 	}
+	var initialDone int
+	if err := store.db.QueryRow(
+		"SELECT initial_backfill_done FROM containers WHERE host = ? AND container_id = ?",
+		"local", "aaa",
+	).Scan(&initialDone); err != nil {
+		t.Fatalf("read initial backfill marker: %v", err)
+	}
+	if initialDone != 1 {
+		t.Fatal("successful engine read did not durably mark the initial backfill complete")
+	}
 
 	containers, err := store.ListContainers(context.Background())
 	if err != nil {
@@ -762,6 +788,57 @@ func TestNewGenerationBackfillsFromCreation(t *testing.T) {
 	}
 	if len(containers) != 1 || containers[0].Image != "app:latest" || containers[0].ComposeProject != "demostack" {
 		t.Fatalf("engine metadata was not recorded: %+v", containers)
+	}
+}
+
+// A live tail can attach after a container has already emitted records but
+// before the lifecycle sync discovers the generation. Those live records
+// create the database row and advance its watermark. The generation has still
+// never had its initial backfill, so resuming from that live watermark would
+// permanently skip the earlier engine-retained records.
+func TestLiveWriteBeforeFirstBackfillStillStartsAtCreation(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "aaa"}
+	created := baseTime.Add(-time.Hour)
+
+	writeEntries(t, store, key, "web",
+		entryAt(baseTime, "stdout", "live tail attached after earlier records"),
+	)
+
+	since, err := store.backfillSince(context.Background(), key, created.Unix())
+	if err != nil {
+		t.Fatalf("backfillSince: %v", err)
+	}
+	want := created.UTC().Format(time.RFC3339Nano)
+	if since != want {
+		t.Fatalf("first backfill Since = %s, want container creation time %s: early retained records are skipped",
+			since, want)
+	}
+}
+
+func TestFailedInitialBackfillDoesNotAdvanceTheDurableMarker(t *testing.T) {
+	store := newTestStore(t)
+	engine := newFakeEngine(containerInfo("local", "aaa", "web", baseTime))
+	engine.tail = func(_, _ string, _ models.LogOptions, _ func(models.LogEntry)) error {
+		return errors.New("temporary engine read failure")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	store.start(ctx, &fakeHub{}, func() Engine { return engine })
+	waitFor(t, "failed backfill attempt", func() bool { return engine.calls("aaa") == 1 })
+	time.Sleep(2 * batchInterval)
+	cancel()
+	store.Wait()
+
+	var initialDone int
+	if err := store.db.QueryRow(
+		"SELECT initial_backfill_done FROM containers WHERE host = ? AND container_id = ?",
+		"local", "aaa",
+	).Scan(&initialDone); err != nil {
+		t.Fatalf("read initial backfill marker: %v", err)
+	}
+	if initialDone != 0 {
+		t.Fatal("failed engine read marked the initial backfill complete")
 	}
 }
 
@@ -913,6 +990,15 @@ func TestMigrationFromV1AddsTheForeignKey(t *testing.T) {
 	if version != schemaVersion {
 		t.Fatalf("user_version = %d, want %d", version, schemaVersion)
 	}
+	var initialDone int
+	if err := store.db.QueryRow(
+		"SELECT initial_backfill_done FROM containers WHERE id = 1",
+	).Scan(&initialDone); err != nil {
+		t.Fatalf("read migrated initial backfill marker: %v", err)
+	}
+	if initialDone != 0 {
+		t.Fatal("legacy generation was assumed complete instead of scheduling one safe creation-time reread")
+	}
 
 	page, err := store.Query(context.Background(), LogQuery{Container: "web"})
 	if err != nil {
@@ -1025,6 +1111,7 @@ func TestRestartDoesNotLoseTheDowntimeWindow(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 	writeEntries(t, previous, key, "web", entryAt(baseTime, "stdout", "before the restart"))
+	markInitialBackfillDone(t, previous, key, "web")
 	if err := previous.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -1220,6 +1307,7 @@ func TestDroppedLinesAreReReadFromTheEngine(t *testing.T) {
 
 	// The next backfill resumes from the drop, even though the watermark is newer.
 	writeEntries(t, store, key, "web", entryAt(baseTime.Add(2*time.Minute), "stdout", "later line"))
+	markInitialBackfillDone(t, store, key, "web")
 	since, err := store.backfillSince(context.Background(), key, 0)
 	if err != nil {
 		t.Fatalf("backfillSince: %v", err)
