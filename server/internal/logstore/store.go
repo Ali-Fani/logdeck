@@ -138,6 +138,10 @@ type Store struct {
 
 	// backfillState is owned by the sync loop.
 	backfillSem chan struct{}
+	// reconcileCh coalesces loss and lifecycle notices into an immediate
+	// lifecycle pass. The periodic sync remains the safety net, but recoverable
+	// gaps should not sit pending until its next tick.
+	reconcileCh chan struct{}
 }
 
 // DBPath returns the log database path that sits next to the config file
@@ -221,6 +225,7 @@ func Open(path string, limits Limits) (*Store, error) {
 		refresh:     make(map[genKey]uint64),
 		invalidated: make(map[genKey]struct{}),
 		backfillSem: make(chan struct{}, maxConcurrentBackfills),
+		reconcileCh: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -328,6 +333,16 @@ func (s *Store) recover(hint logstream.RecoveryHint) {
 	s.markGap(key, hint.Earliest.UnixNano())
 }
 
+// requestReconcile wakes the lifecycle loop without ever blocking a live-log
+// delivery goroutine. One pending wake is sufficient: a reconciliation reads
+// every outstanding generation marker.
+func (s *Store) requestReconcile() {
+	select {
+	case s.reconcileCh <- struct{}{}:
+	default:
+	}
+}
+
 // resumePoint is one generation's persisted per-stream backfill watermarks.
 type resumePoint struct {
 	stdoutWM    int64
@@ -399,13 +414,18 @@ type gapMark struct {
 // the notice version even if a repeated line has the same timestamp.
 func (s *Store) markGap(key genKey, tsNS int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	mark := s.gaps[key]
+	wasPending := mark.version != 0
 	mark.version++
 	if mark.from == 0 || tsNS < mark.from {
 		mark.from = tsNS
 	}
 	s.gaps[key] = mark
+	s.mu.Unlock()
+
+	if !wasPending {
+		s.requestReconcile()
+	}
 }
 
 // gapAt reports the generation's outstanding gap, or 0 when it has none.
@@ -433,8 +453,13 @@ func (s *Store) clearGap(key genKey, healed gapMark) {
 
 func (s *Store) markRefresh(key genKey) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	wasPending := s.refresh[key] != 0
 	s.refresh[key]++
+	s.mu.Unlock()
+
+	if !wasPending {
+		s.requestReconcile()
+	}
 }
 
 func (s *Store) refreshAt(key genKey) uint64 {

@@ -741,6 +741,32 @@ func TestStoreRequestsRecoverableSubscription(t *testing.T) {
 	store.Wait()
 }
 
+func TestRecoveryHintTriggersImmediateBackfill(t *testing.T) {
+	store := newTestStore(t)
+	hub := &fakeHub{}
+	engine := newFakeEngine(containerInfo("local", "aaa", "web", baseTime))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		store.Wait()
+	}()
+
+	store.start(ctx, hub, func() Engine { return engine })
+	waitFor(t, "initial backfill", func() bool { return engine.calls("aaa") == 1 })
+
+	if ok := hub.hint(logstream.RecoveryHint{
+		Host: "local", ContainerID: "aaa",
+	}); !ok {
+		t.Fatal("store did not register a recoverable subscription")
+	}
+
+	// syncInterval is 15 seconds. The ordinary test deadline is five seconds,
+	// so this can pass only through the event-driven recovery wake.
+	waitFor(t, "recovery backfill before the periodic sync", func() bool {
+		return engine.calls("aaa") >= 2
+	})
+}
+
 // TestBackfillDedupAtBoundary re-reads a generation whose watermark already
 // covers part of the engine's output: the overlapping lines must not be stored
 // twice, and the lines that are genuinely new must land.
