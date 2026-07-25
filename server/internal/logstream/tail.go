@@ -3,6 +3,7 @@ package logstream
 import (
 	"context"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/AmoabaKelvin/logdeck/internal/models"
@@ -14,7 +15,8 @@ const maxTailAttempts = 5
 
 // tail is the run loop's handle to one tail goroutine.
 type tail struct {
-	cancel context.CancelFunc
+	cancel   context.CancelFunc
+	draining atomic.Bool // set by the run loop after die/destroy
 }
 
 // spawnTail starts a tail goroutine for one (subscription, container) pair.
@@ -31,7 +33,7 @@ func (h *Hub) spawnTail(sub *subscription, key containerKey, name string, labels
 	go func() {
 		defer h.tailWg.Done()
 		defer cancel()
-		h.runTail(ctx, client, sub, key, name, labels)
+		h.runTail(ctx, client, sub, t, key, name, labels)
 		// Tell the loop this tail is gone so resync can respawn it. Skipped
 		// on shutdown, when the loop is no longer receiving.
 		select {
@@ -44,7 +46,15 @@ func (h *Hub) spawnTail(sub *subscription, key containerKey, name string, labels
 // runTail opens the log tail and keeps it open while desired, retrying with
 // exponential backoff when the stream ends prematurely. Returns when ctx is
 // cancelled (tail no longer desired) or after maxTailAttempts.
-func (h *Hub) runTail(ctx context.Context, client engineClient, sub *subscription, key containerKey, name string, labels map[string]string) {
+func (h *Hub) runTail(
+	ctx context.Context,
+	client engineClient,
+	sub *subscription,
+	t *tail,
+	key containerKey,
+	name string,
+	labels map[string]string,
+) {
 	emit := func(entry models.LogEntry) {
 		sub.push(Record{
 			Host:          key.host,
@@ -59,6 +69,13 @@ func (h *Hub) runTail(ctx context.Context, client engineClient, sub *subscriptio
 	for attempt := 1; ; attempt++ {
 		err := client.openTail(ctx, key.host, key.id, sub.opts, emit)
 		if ctx.Err() != nil {
+			return
+		}
+		// A clean EOF after die/destroy means Docker drained the followed
+		// response. Without a lifecycle boundary, preserve the existing retry
+		// behavior: a daemon or proxy can close an otherwise-live stream with a
+		// plain EOF, and waiting for the minute resync would create a long gap.
+		if err == nil && t.draining.Load() {
 			return
 		}
 		if attempt >= maxTailAttempts {

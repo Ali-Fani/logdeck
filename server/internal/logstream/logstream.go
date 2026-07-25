@@ -40,6 +40,16 @@ type Record struct {
 	Entry         models.LogEntry
 }
 
+// RecoveryHint tells a persistence subscriber that the live stream may have
+// skipped engine-retained records. Earliest is set when the exact oldest
+// dropped record is known. A zero value means reread from the subscriber's
+// durable watermark, as at a container lifecycle boundary.
+type RecoveryHint struct {
+	Host        string
+	ContainerID string
+	Earliest    time.Time
+}
+
 // ContainerSpec selects containers to tail. All dimensions are optional and
 // ANDed together; an empty slice matches everything in that dimension.
 type ContainerSpec struct {
@@ -178,10 +188,34 @@ func (h *Hub) Subscribe(spec ContainerSpec, opts models.LogOptions, sink func(Re
 	return unsubscribe
 }
 
+// SubscribeRecoverable is Subscribe plus recovery notifications for subscribers
+// that can reread the engine, such as the persistent log store. The callback
+// must return promptly. Ordinary live consumers use Subscribe and accept
+// bounded-buffer loss.
+func (h *Hub) SubscribeRecoverable(
+	spec ContainerSpec,
+	opts models.LogOptions,
+	sink func(Record),
+	recover func(RecoveryHint),
+) (unsubscribe func()) {
+	opts.Follow = true
+	_, unsubscribe = h.subscribeRecoverable(spec, opts, sink, recover)
+	return unsubscribe
+}
+
 // subscribe is the internal form of Subscribe that also exposes the
 // subscription handle (used by tests to observe drop counters).
 func (h *Hub) subscribe(spec ContainerSpec, opts models.LogOptions, sink func(Record)) (*subscription, func()) {
-	sub := newSubscription(spec, opts, sink)
+	return h.subscribeRecoverable(spec, opts, sink, nil)
+}
+
+func (h *Hub) subscribeRecoverable(
+	spec ContainerSpec,
+	opts models.LogOptions,
+	sink func(Record),
+	recover func(RecoveryHint),
+) (*subscription, func()) {
+	sub := newSubscription(spec, opts, sink, recover)
 	registered := h.do(func() {
 		h.subs[sub] = struct{}{}
 		go sub.deliverLoop()
@@ -306,8 +340,10 @@ func (h *Hub) requestList() {
 	}()
 }
 
-// handleEvent is the fast path: start spawns matching tails immediately,
-// die/destroy cancel them, rename is treated as destroy plus a re-list.
+// handleEvent is the fast path: start spawns matching tails immediately;
+// die/destroy let the engine response drain and ask recoverable subscribers for
+// a final reread; rename cancels and re-lists because the selection metadata
+// changed.
 func (h *Hub) handleEvent(ev docker.EngineEvent) {
 	base, _, _ := strings.Cut(ev.Action, ": ")
 	switch base {
@@ -315,8 +351,15 @@ func (h *Hub) handleEvent(ev docker.EngineEvent) {
 		name := strings.TrimPrefix(ev.ContainerName, "/")
 		key := containerKey{host: ev.Host, id: ev.ContainerID}
 		for sub := range h.subs {
-			if _, ok := sub.tails[key]; ok {
-				continue
+			if current, ok := sub.tails[key]; ok {
+				if !current.draining.Load() {
+					continue
+				}
+				// A fast restart can arrive before the old followed response
+				// reaches EOF. Its recovery marker is already set; replace it
+				// now so the new run is tailed without waiting for resync.
+				current.cancel()
+				delete(sub.tails, key)
 			}
 			if !sub.spec.Matches(ev.Host, name, ev.Labels) {
 				continue
@@ -324,7 +367,15 @@ func (h *Hub) handleEvent(ev docker.EngineEvent) {
 			h.spawnTail(sub, key, name, ev.Labels)
 		}
 	case "die", "destroy":
-		h.cancelTails(containerKey{host: ev.Host, id: ev.ContainerID})
+		key := containerKey{host: ev.Host, id: ev.ContainerID}
+		for sub := range h.subs {
+			if current, ok := sub.tails[key]; ok {
+				current.draining.Store(true)
+				sub.requestRecovery(RecoveryHint{
+					Host: key.host, ContainerID: key.id,
+				})
+			}
+		}
 	case "rename":
 		h.cancelTails(containerKey{host: ev.Host, id: ev.ContainerID})
 		h.requestList()
@@ -398,6 +449,9 @@ func (h *Hub) handleList(res listResult) {
 			if meta, ok := running[key]; ok && sub.spec.Matches(key.host, meta.name, meta.labels) {
 				continue
 			}
+			sub.requestRecovery(RecoveryHint{
+				Host: key.host, ContainerID: key.id,
+			})
 			t.cancel()
 			delete(sub.tails, key)
 		}
@@ -421,6 +475,9 @@ func (h *Hub) handleTailExit(ex tailExit) {
 		return
 	}
 	if current, ok := ex.sub.tails[ex.key]; ok && current == ex.t {
+		ex.sub.requestRecovery(RecoveryHint{
+			Host: ex.key.host, ContainerID: ex.key.id,
+		})
 		delete(ex.sub.tails, ex.key)
 	}
 }

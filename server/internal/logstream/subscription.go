@@ -23,6 +23,9 @@ type subscription struct {
 	spec ContainerSpec
 	opts models.LogOptions
 	sink func(Record)
+	// recover is set only for subscribers that can reread the engine. It must
+	// return promptly; push calls it on the tail goroutine.
+	recover func(RecoveryHint)
 
 	// tails is owned exclusively by the hub's run loop goroutine.
 	tails map[containerKey]*tail
@@ -39,11 +42,17 @@ type subscription struct {
 	delivered chan struct{} // closed when the delivery goroutine exits
 }
 
-func newSubscription(spec ContainerSpec, opts models.LogOptions, sink func(Record)) *subscription {
+func newSubscription(
+	spec ContainerSpec,
+	opts models.LogOptions,
+	sink func(Record),
+	recover func(RecoveryHint),
+) *subscription {
 	s := &subscription{
 		spec:      spec,
 		opts:      opts,
 		sink:      sink,
+		recover:   recover,
 		tails:     make(map[containerKey]*tail),
 		buf:       make([]Record, ringSize),
 		delivered: make(chan struct{}),
@@ -61,7 +70,9 @@ func (s *subscription) push(r Record) {
 		return
 	}
 	dropped := false
+	var lost Record
 	if s.count == len(s.buf) {
+		lost = s.buf[s.head]
 		s.buf[s.head] = Record{}
 		s.head = (s.head + 1) % len(s.buf)
 		s.count--
@@ -73,9 +84,22 @@ func (s *subscription) push(r Record) {
 	s.mu.Unlock()
 
 	if dropped {
+		s.requestRecovery(RecoveryHint{
+			Host:        lost.Host,
+			ContainerID: lost.ContainerID,
+			Earliest:    lost.Entry.Timestamp,
+		})
 		if n := s.drops.Add(1); n%dropLogEvery == 0 {
 			log.Printf("logstream: subscription %+v dropped %d records (slow sink)", s.spec, n)
 		}
+	}
+}
+
+// requestRecovery is intentionally called without s.mu held: the receiver may
+// take its own lock, and a persistence callback must never stall buffer access.
+func (s *subscription) requestRecovery(hint RecoveryHint) {
+	if s.recover != nil {
+		s.recover(hint)
 	}
 }
 

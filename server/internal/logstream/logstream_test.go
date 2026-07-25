@@ -273,8 +273,17 @@ func TestStartEventSpawnsTail(t *testing.T) {
 	waitFor(t, "start event to spawn tail", func() bool { return f.activeTails(containerKey{"h1", "c9"}) == 1 })
 }
 
-func TestDieEventCancelsTail(t *testing.T) {
+func TestDieEventLetsTailDrainBeforeItStops(t *testing.T) {
+	release := make(chan struct{})
 	f := newFakeClient()
+	f.tailFn = func(ctx context.Context, host, id string, opts models.LogOptions, emit func(models.LogEntry)) error {
+		<-release
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		emit(models.LogEntry{Message: "final buffered record"})
+		return nil
+	}
 	f.set(map[string][]models.ContainerInfo{"h1": {ctr("c1", "web", "running", nil)}}, nil)
 	h := startHub(t, func() engineClient { return f })
 
@@ -284,12 +293,55 @@ func TestDieEventCancelsTail(t *testing.T) {
 	waitFor(t, "tail to start", func() bool { return f.activeTails(key) == 1 })
 
 	f.set(map[string][]models.ContainerInfo{"h1": {}}, nil)
-	f.events <- docker.EngineEvent{Host: "h1", ContainerID: "c1", ContainerName: "web", Action: "die"}
-
-	waitFor(t, "die event to cancel tail", func() bool { return f.activeTails(key) == 0 })
-	if n := f.totalStarts(key); n != 1 {
-		t.Errorf("tail restarted after die: %d starts", n)
+	handled := make(chan struct{})
+	if !h.do(func() {
+		h.handleEvent(docker.EngineEvent{
+			Host: "h1", ContainerID: "c1", ContainerName: "web", Action: "die",
+		})
+		close(handled)
+	}) {
+		t.Fatal("hub stopped before processing die event")
 	}
+	<-handled
+
+	// Allow the Docker response to finish only after the event was handled. If
+	// die cancelled the tail, the final record is discarded.
+	close(release)
+
+	waitFor(t, "final buffered record to drain", func() bool { return rec.len() == 1 })
+	waitFor(t, "cleanly ended tail to stop", func() bool { return f.activeTails(key) == 0 })
+	if n := f.totalStarts(key); n != 1 {
+		t.Errorf("cleanly ended tail restarted after die: %d starts", n)
+	}
+}
+
+func TestStartAfterDieReplacesDrainingTail(t *testing.T) {
+	f := newFakeClient()
+	f.set(map[string][]models.ContainerInfo{"h1": {ctr("c1", "web", "running", nil)}}, nil)
+	h := startHub(t, func() engineClient { return f })
+
+	rec := &recorder{}
+	h.Subscribe(ContainerSpec{}, models.LogOptions{}, rec.sink)
+	key := containerKey{"h1", "c1"}
+	waitFor(t, "first run tail", func() bool { return f.activeTails(key) == 1 })
+
+	handled := make(chan struct{})
+	if !h.do(func() {
+		h.handleEvent(docker.EngineEvent{
+			Host: "h1", ContainerID: "c1", ContainerName: "web", Action: "die",
+		})
+		h.handleEvent(docker.EngineEvent{
+			Host: "h1", ContainerID: "c1", ContainerName: "web", Action: "start",
+		})
+		close(handled)
+	}) {
+		t.Fatal("hub stopped before processing restart events")
+	}
+	<-handled
+
+	waitFor(t, "new run tail", func() bool {
+		return f.totalStarts(key) == 2 && f.activeTails(key) == 1
+	})
 }
 
 func TestUnsubscribeCancelsAndIsIdempotent(t *testing.T) {
@@ -354,10 +406,23 @@ func TestSlowSinkDropsOldestAndTailKeepsReading(t *testing.T) {
 
 	gate := make(chan struct{})
 	rec := &recorder{}
-	sub, unsubscribe := h.subscribe(ContainerSpec{}, models.LogOptions{}, func(r Record) {
-		<-gate
-		rec.sink(r)
-	})
+	var (
+		hintsMu sync.Mutex
+		hints   []RecoveryHint
+	)
+	sub, unsubscribe := h.subscribeRecoverable(
+		ContainerSpec{},
+		models.LogOptions{},
+		func(r Record) {
+			<-gate
+			rec.sink(r)
+		},
+		func(hint RecoveryHint) {
+			hintsMu.Lock()
+			defer hintsMu.Unlock()
+			hints = append(hints, hint)
+		},
+	)
 	defer unsubscribe()
 
 	// The tail must finish all pushes while the sink is stuck: it never blocks.
@@ -370,6 +435,12 @@ func TestSlowSinkDropsOldestAndTailKeepsReading(t *testing.T) {
 	drops := sub.drops.Load()
 	if drops < uint64(total-ringSize-1) {
 		t.Fatalf("drop counter = %d, want >= %d", drops, total-ringSize-1)
+	}
+	hintsMu.Lock()
+	hintCount := len(hints)
+	hintsMu.Unlock()
+	if hintCount != int(drops) {
+		t.Fatalf("recovery hints = %d, want one for each of %d dropped records", hintCount, drops)
 	}
 
 	close(gate)

@@ -558,23 +558,43 @@ func TestOpenFromConfigUnwritablePathDisablesStore(t *testing.T) {
 // --- pipeline fakes ---------------------------------------------------------
 
 type fakeHub struct {
-	mu    sync.Mutex
-	sink  func(logstream.Record)
-	unsub bool
+	mu      sync.Mutex
+	sink    func(logstream.Record)
+	recover func(logstream.RecoveryHint)
+	unsub   bool
 }
 
 func (h *fakeHub) Subscribe(_ logstream.ContainerSpec, opts models.LogOptions, sink func(logstream.Record)) func() {
+	return h.subscribe(opts, sink, nil)
+}
+
+func (h *fakeHub) SubscribeRecoverable(
+	_ logstream.ContainerSpec,
+	opts models.LogOptions,
+	sink func(logstream.Record),
+	recover func(logstream.RecoveryHint),
+) func() {
+	return h.subscribe(opts, sink, recover)
+}
+
+func (h *fakeHub) subscribe(
+	opts models.LogOptions,
+	sink func(logstream.Record),
+	recover func(logstream.RecoveryHint),
+) func() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !opts.ShowStdout || !opts.ShowStderr || !opts.Timestamps || opts.Tail != "0" {
 		panic(fmt.Sprintf("logstore subscribed with unusable options: %+v", opts))
 	}
 	h.sink = sink
+	h.recover = recover
 	return func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		h.unsub = true
 		h.sink = nil
+		h.recover = nil
 	}
 }
 
@@ -585,6 +605,17 @@ func (h *fakeHub) emit(rec logstream.Record) {
 	if sink != nil {
 		sink(rec)
 	}
+}
+
+func (h *fakeHub) hint(hint logstream.RecoveryHint) bool {
+	h.mu.Lock()
+	recover := h.recover
+	h.mu.Unlock()
+	if recover == nil {
+		return false
+	}
+	recover(hint)
+	return true
 }
 
 type fakeEngine struct {
@@ -677,6 +708,37 @@ func countLines(t *testing.T, s *Store) int {
 		t.Fatalf("count lines: %v", err)
 	}
 	return count
+}
+
+func TestStoreRequestsRecoverableSubscription(t *testing.T) {
+	store := newTestStore(t)
+	hub := &fakeHub{}
+	engine := newFakeEngine()
+	ctx, cancel := context.WithCancel(context.Background())
+	store.start(ctx, hub, func() Engine { return engine })
+
+	key := genKey{"local", "aaa"}
+	if ok := hub.hint(logstream.RecoveryHint{
+		Host: key.host, ContainerID: key.id,
+	}); !ok {
+		cancel()
+		store.Wait()
+		t.Fatal("store used the lossy subscription API; stream gaps cannot trigger engine recovery")
+	}
+	if got := store.refreshAt(key); got != 1 {
+		t.Fatalf("lifecycle recovery marker = %d, want 1", got)
+	}
+
+	dropped := baseTime.Add(time.Minute)
+	hub.hint(logstream.RecoveryHint{
+		Host: key.host, ContainerID: key.id, Earliest: dropped,
+	})
+	if got := store.gapAt(key); got != dropped.UnixNano() {
+		t.Fatalf("dropped-record gap = %d, want %d", got, dropped.UnixNano())
+	}
+
+	cancel()
+	store.Wait()
 }
 
 // TestBackfillDedupAtBoundary re-reads a generation whose watermark already
@@ -1332,6 +1394,68 @@ func TestDroppedLinesAreReReadFromTheEngine(t *testing.T) {
 	}
 	if track.schedule(store, key, false) {
 		t.Fatal("a healed generation must not be re-read forever")
+	}
+}
+
+func TestRecoveryNoticeDuringBackfillIsNotClearedByThatBackfill(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "aaa"}
+	track := newBackfillTracker()
+
+	if !track.schedule(store, key, false) {
+		t.Fatal("initial backfill was not scheduled")
+	}
+	store.markRefresh(key)
+	if track.schedule(store, key, false) {
+		t.Fatal("a second backfill started while one was already in flight")
+	}
+
+	delete(track.inFlight, key)
+	track.complete(store, key)
+	if got := store.refreshAt(key); got == 0 {
+		t.Fatal("an older in-flight backfill cleared a lifecycle notice that arrived after it started")
+	}
+	if !track.schedule(store, key, false) {
+		t.Fatal("the lifecycle notice did not schedule a follow-up backfill")
+	}
+
+	delete(track.inFlight, key)
+	track.complete(store, key)
+	if got := store.refreshAt(key); got != 0 {
+		t.Fatalf("completed follow-up left lifecycle marker %d pending", got)
+	}
+	if track.schedule(store, key, false) {
+		t.Fatal("healed lifecycle boundary scheduled another backfill")
+	}
+}
+
+func TestRepeatedGapTimestampDuringBackfillRemainsPending(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "aaa"}
+	track := newBackfillTracker()
+	ts := baseTime.UnixNano()
+
+	store.markGap(key, ts)
+	if !track.schedule(store, key, false) {
+		t.Fatal("first gap did not schedule a backfill")
+	}
+	// The same record can be dropped again while the read is in flight. Its
+	// timestamp is identical, but the older read did not necessarily cover it.
+	store.markGap(key, ts)
+
+	delete(track.inFlight, key)
+	track.complete(store, key)
+	if got := store.gapAt(key); got != ts {
+		t.Fatalf("older backfill cleared repeated gap: got %d, want %d", got, ts)
+	}
+	if !track.schedule(store, key, false) {
+		t.Fatal("repeated gap did not schedule a follow-up backfill")
+	}
+
+	delete(track.inFlight, key)
+	track.complete(store, key)
+	if got := store.gapAt(key); got != 0 {
+		t.Fatalf("follow-up backfill left gap %d pending", got)
 	}
 }
 
