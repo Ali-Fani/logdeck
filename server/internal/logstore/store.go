@@ -297,8 +297,9 @@ func (s *Store) sink(rec logstream.Record) {
 
 // resumePoint is one generation's persisted per-stream backfill watermarks.
 type resumePoint struct {
-	stdoutWM int64
-	stderrWM int64
+	stdoutWM    int64
+	stderrWM    int64
+	initialDone bool
 }
 
 // snapshotResume records every generation's persisted resume point. It runs
@@ -307,7 +308,9 @@ type resumePoint struct {
 // last few seconds.
 func (s *Store) snapshotResume(ctx context.Context) error {
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT host, container_id, stdout_wm_ns, stderr_wm_ns FROM containers")
+		`SELECT host, container_id, stdout_wm_ns, stderr_wm_ns,
+		        initial_backfill_done
+		 FROM containers`)
 	if err != nil {
 		return err
 	}
@@ -317,12 +320,20 @@ func (s *Store) snapshotResume(ctx context.Context) error {
 	defer s.mu.Unlock()
 	for rows.Next() {
 		var (
-			key   genKey
-			point resumePoint
+			key         genKey
+			point       resumePoint
+			initialDone int
 		)
-		if err := rows.Scan(&key.host, &key.id, &point.stdoutWM, &point.stderrWM); err != nil {
+		if err := rows.Scan(
+			&key.host,
+			&key.id,
+			&point.stdoutWM,
+			&point.stderrWM,
+			&initialDone,
+		); err != nil {
 			return err
 		}
+		point.initialDone = initialDone != 0
 		s.resume[key] = point
 	}
 	return rows.Err()

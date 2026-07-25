@@ -46,8 +46,11 @@ type ingestMsg struct {
 
 	line line // msgLine
 
-	// msgDone: non-empty when the generation is excluded from persistence.
-	reason string
+	// msgDone fields. complete is true only when the engine read reached EOF
+	// successfully. A transiently failed read must leave the generation's
+	// initial backfill pending so a retry still starts from creation.
+	complete bool
+	reason   string // non-empty when the generation is excluded from persistence
 }
 
 // lineFromEntry converts a parsed hub/tail entry into a storable line. The
@@ -222,6 +225,12 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 		}
 
 		if msg.kind == msgDone {
+			if msg.complete {
+				if _, err := tx.ExecContext(ctx,
+					"UPDATE containers SET initial_backfill_done = 1 WHERE id = ?", ref); err != nil {
+					return err
+				}
+			}
 			if msg.reason != "" {
 				if _, err := tx.ExecContext(ctx,
 					"UPDATE containers SET excluded_reason = ? WHERE id = ?", msg.reason, ref); err != nil {
