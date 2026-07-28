@@ -3,6 +3,7 @@ package logstream
 import (
 	"context"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -67,7 +68,24 @@ func (h *Hub) runTail(
 
 	delay := h.retryBaseDelay
 	for attempt := 1; ; attempt++ {
-		err := client.openTail(ctx, key.host, key.id, sub.opts, emit)
+		var attachment sync.Once
+		attemptEmit := func(entry models.LogEntry) {
+			// A recoverable subscriber can request a one-record overlap when it
+			// opens a followed stream. Seeing that overlap proves the stream is
+			// attached, but not that records emitted between container start and
+			// attachment were observed. Reconcile that finite boundary once per
+			// successful attachment; durable insertion deduplication absorbs the
+			// deliberately repeated record.
+			attachment.Do(func() {
+				if sub.opts.Tail == "1" {
+					sub.requestRecovery(RecoveryHint{
+						Host: key.host, ContainerID: key.id,
+					})
+				}
+			})
+			emit(entry)
+		}
+		err := client.openTail(ctx, key.host, key.id, sub.opts, attemptEmit)
 		if ctx.Err() != nil {
 			return
 		}

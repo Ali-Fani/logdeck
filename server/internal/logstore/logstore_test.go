@@ -561,6 +561,7 @@ type fakeHub struct {
 	mu      sync.Mutex
 	sink    func(logstream.Record)
 	recover func(logstream.RecoveryHint)
+	opts    models.LogOptions
 	unsub   bool
 }
 
@@ -584,9 +585,10 @@ func (h *fakeHub) subscribe(
 ) func() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !opts.ShowStdout || !opts.ShowStderr || !opts.Timestamps || opts.Tail != "0" {
+	if !opts.ShowStdout || !opts.ShowStderr || !opts.Timestamps {
 		panic(fmt.Sprintf("logstore subscribed with unusable options: %+v", opts))
 	}
+	h.opts = opts
 	h.sink = sink
 	h.recover = recover
 	return func() {
@@ -716,6 +718,13 @@ func TestStoreRequestsRecoverableSubscription(t *testing.T) {
 	engine := newFakeEngine()
 	ctx, cancel := context.WithCancel(context.Background())
 	store.start(ctx, hub, func() Engine { return engine })
+
+	hub.mu.Lock()
+	tail := hub.opts.Tail
+	hub.mu.Unlock()
+	if tail != "1" {
+		t.Fatalf("logstore live tail = %q, want one-record overlap at the attachment boundary", tail)
+	}
 
 	key := genKey{"local", "aaa"}
 	if ok := hub.hint(logstream.RecoveryHint{

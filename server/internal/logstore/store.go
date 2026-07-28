@@ -248,7 +248,11 @@ func (s *Store) start(ctx context.Context, hub Hub, source func() Engine) {
 	s.producers.Add(1)
 	spec := logstream.ContainerSpec{} // all containers on all hosts
 	opts := models.LogOptions{
-		Follow: true, Timestamps: true, Tail: "0",
+		// Tail one retained record when the followed response attaches. The hub
+		// converts that first record into a recovery hint, which closes the
+		// finite container-start-to-stream-attachment window. The store's exact
+		// insertion key removes the intentional overlap.
+		Follow: true, Timestamps: true, Tail: "1",
 		ShowStdout: true, ShowStderr: true,
 	}
 	var unsubscribe func()

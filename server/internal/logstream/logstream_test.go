@@ -273,6 +273,49 @@ func TestStartEventSpawnsTail(t *testing.T) {
 	waitFor(t, "start event to spawn tail", func() bool { return f.activeTails(containerKey{"h1", "c9"}) == 1 })
 }
 
+func TestFirstRecordOnNewTailRequestsAttachmentRecovery(t *testing.T) {
+	f := newFakeClient()
+	f.tailFn = func(ctx context.Context, host, id string, opts models.LogOptions, emit func(models.LogEntry)) error {
+		emit(models.LogEntry{Message: "attachment boundary"})
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	h := startHub(t, func() engineClient { return f })
+
+	rec := &recorder{}
+	var (
+		hintsMu sync.Mutex
+		hints   []RecoveryHint
+	)
+	h.SubscribeRecoverable(
+		ContainerSpec{Containers: []string{"api"}},
+		models.LogOptions{Tail: "1"},
+		rec.sink,
+		func(hint RecoveryHint) {
+			hintsMu.Lock()
+			defer hintsMu.Unlock()
+			hints = append(hints, hint)
+		},
+	)
+
+	f.events <- docker.EngineEvent{
+		Host: "h1", ContainerID: "c9", ContainerName: "api", Action: "start",
+	}
+
+	waitFor(t, "first record delivery", func() bool { return rec.len() == 1 })
+	waitFor(t, "attachment recovery hint", func() bool {
+		hintsMu.Lock()
+		defer hintsMu.Unlock()
+		return len(hints) == 1
+	})
+	hintsMu.Lock()
+	hint := hints[0]
+	hintsMu.Unlock()
+	if hint.Host != "h1" || hint.ContainerID != "c9" || !hint.Earliest.IsZero() {
+		t.Fatalf("attachment recovery hint = %+v, want zero-point hint for h1/c9", hint)
+	}
+}
+
 func TestDieEventLetsTailDrainBeforeItStops(t *testing.T) {
 	release := make(chan struct{})
 	f := newFakeClient()
