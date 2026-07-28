@@ -276,7 +276,8 @@ func TestStartEventSpawnsTail(t *testing.T) {
 func TestFirstRecordOnNewTailRequestsAttachmentRecovery(t *testing.T) {
 	f := newFakeClient()
 	f.tailFn = func(ctx context.Context, host, id string, opts models.LogOptions, emit func(models.LogEntry)) error {
-		emit(models.LogEntry{Message: "attachment boundary"})
+		emit(models.LogEntry{Message: "attachment boundary 1"})
+		emit(models.LogEntry{Message: "attachment boundary 2"})
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -302,7 +303,7 @@ func TestFirstRecordOnNewTailRequestsAttachmentRecovery(t *testing.T) {
 		Host: "h1", ContainerID: "c9", ContainerName: "api", Action: "start",
 	}
 
-	waitFor(t, "first record delivery", func() bool { return rec.len() == 1 })
+	waitFor(t, "record delivery", func() bool { return rec.len() == 2 })
 	waitFor(t, "attachment recovery hint", func() bool {
 		hintsMu.Lock()
 		defer hintsMu.Unlock()
@@ -313,6 +314,51 @@ func TestFirstRecordOnNewTailRequestsAttachmentRecovery(t *testing.T) {
 	hintsMu.Unlock()
 	if hint.Host != "h1" || hint.ContainerID != "c9" || !hint.Earliest.IsZero() {
 		t.Fatalf("attachment recovery hint = %+v, want zero-point hint for h1/c9", hint)
+	}
+	hintsMu.Lock()
+	hintCount := len(hints)
+	hintsMu.Unlock()
+	if hintCount != 1 {
+		t.Fatalf("attachment recovery hints = %d, want exactly one", hintCount)
+	}
+}
+
+func TestOrdinaryTailDoesNotRequestAttachmentRecovery(t *testing.T) {
+	f := newFakeClient()
+	f.tailFn = func(ctx context.Context, host, id string, opts models.LogOptions, emit func(models.LogEntry)) error {
+		emit(models.LogEntry{Message: "ordinary tail 1"})
+		emit(models.LogEntry{Message: "ordinary tail 2"})
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	h := startHub(t, func() engineClient { return f })
+
+	rec := &recorder{}
+	var (
+		hintsMu sync.Mutex
+		hints   []RecoveryHint
+	)
+	h.SubscribeRecoverable(
+		ContainerSpec{Containers: []string{"api"}},
+		models.LogOptions{Tail: "0"},
+		rec.sink,
+		func(hint RecoveryHint) {
+			hintsMu.Lock()
+			defer hintsMu.Unlock()
+			hints = append(hints, hint)
+		},
+	)
+
+	f.events <- docker.EngineEvent{
+		Host: "h1", ContainerID: "c9", ContainerName: "api", Action: "start",
+	}
+
+	waitFor(t, "record delivery", func() bool { return rec.len() == 2 })
+	hintsMu.Lock()
+	hintCount := len(hints)
+	hintsMu.Unlock()
+	if hintCount != 0 {
+		t.Fatalf("attachment recovery hints = %d, want none for Tail 0", hintCount)
 	}
 }
 
