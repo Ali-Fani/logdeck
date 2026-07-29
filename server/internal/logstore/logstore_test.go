@@ -561,6 +561,7 @@ type fakeHub struct {
 	mu      sync.Mutex
 	sink    func(logstream.Record)
 	recover func(logstream.RecoveryHint)
+	opts    models.LogOptions
 	unsub   bool
 }
 
@@ -584,9 +585,10 @@ func (h *fakeHub) subscribe(
 ) func() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !opts.ShowStdout || !opts.ShowStderr || !opts.Timestamps || opts.Tail != "0" {
+	if !opts.ShowStdout || !opts.ShowStderr || !opts.Timestamps {
 		panic(fmt.Sprintf("logstore subscribed with unusable options: %+v", opts))
 	}
+	h.opts = opts
 	h.sink = sink
 	h.recover = recover
 	return func() {
@@ -717,6 +719,13 @@ func TestStoreRequestsRecoverableSubscription(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store.start(ctx, hub, func() Engine { return engine })
 
+	hub.mu.Lock()
+	tail := hub.opts.Tail
+	hub.mu.Unlock()
+	if tail != "1" {
+		t.Fatalf("logstore live tail = %q, want one-record overlap at the attachment boundary", tail)
+	}
+
 	key := genKey{"local", "aaa"}
 	if ok := hub.hint(logstream.RecoveryHint{
 		Host: key.host, ContainerID: key.id,
@@ -739,6 +748,32 @@ func TestStoreRequestsRecoverableSubscription(t *testing.T) {
 
 	cancel()
 	store.Wait()
+}
+
+func TestRecoveryHintTriggersImmediateBackfill(t *testing.T) {
+	store := newTestStore(t)
+	hub := &fakeHub{}
+	engine := newFakeEngine(containerInfo("local", "aaa", "web", baseTime))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		cancel()
+		store.Wait()
+	}()
+
+	store.start(ctx, hub, func() Engine { return engine })
+	waitFor(t, "initial backfill", func() bool { return engine.calls("aaa") == 1 })
+
+	if ok := hub.hint(logstream.RecoveryHint{
+		Host: "local", ContainerID: "aaa",
+	}); !ok {
+		t.Fatal("store did not register a recoverable subscription")
+	}
+
+	// syncInterval is 15 seconds. The ordinary test deadline is five seconds,
+	// so this can pass only through the event-driven recovery wake.
+	waitFor(t, "recovery backfill before the periodic sync", func() bool {
+		return engine.calls("aaa") >= 2
+	})
 }
 
 // TestBackfillDedupAtBoundary re-reads a generation whose watermark already

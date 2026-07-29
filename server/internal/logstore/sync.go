@@ -53,7 +53,19 @@ func (s *Store) syncLoop(ctx context.Context, source func() Engine) {
 				}
 			default:
 				track.complete(s, res.key)
+				// A newer loss/lifecycle notice may have arrived while this
+				// finite engine read was in flight. Its version deliberately
+				// survives complete; wake a follow-up read now instead of
+				// waiting for the periodic lifecycle poll.
+				if s.gapAt(res.key) != 0 || s.refreshAt(res.key) != 0 {
+					s.requestReconcile()
+				}
 			}
+		case <-s.reconcileCh:
+			if ctx.Err() != nil {
+				return
+			}
+			s.sync(ctx, source(), track, results)
 		case <-ticker.C:
 			// select picks a ready case at random: a tick can win over a Done that
 			// is ready too.
