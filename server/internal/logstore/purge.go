@@ -2,6 +2,7 @@ package logstore
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 )
@@ -57,7 +58,7 @@ func (s *Store) DeleteContainer(ctx context.Context, host, name string) (int64, 
 		return 0, ErrContainerNotFound
 	}
 
-	// Lines first: log_lines.container_ref references containers(id).
+	// Lines and blocks first: both reference containers(id).
 	placeholders, args := refArgs(refs)
 	result, err := tx.ExecContext(ctx,
 		"DELETE FROM log_lines WHERE container_ref IN ("+placeholders+")", args...)
@@ -66,6 +67,15 @@ func (s *Store) DeleteContainer(ctx context.Context, host, name string) (int64, 
 	}
 	deleted, err := result.RowsAffected()
 	if err != nil {
+		return 0, err
+	}
+	sealed, err := countSealedLines(ctx, tx, placeholders, args)
+	if err != nil {
+		return 0, err
+	}
+	deleted += sealed
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM log_blocks WHERE container_ref IN ("+placeholders+")", args...); err != nil {
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -87,6 +97,19 @@ func (s *Store) DeleteContainer(ctx context.Context, host, name string) (int64, 
 	return deleted, nil
 }
 
+// countSealedLines totals the lines held inside the generations' sealed blocks,
+// so a purge reports every line it removed rather than only the hot ones.
+func countSealedLines(ctx context.Context, tx *sql.Tx, placeholders string, args []any) (int64, error) {
+	var total sql.NullInt64
+	err := tx.QueryRowContext(ctx,
+		"SELECT SUM(lines) FROM log_blocks WHERE container_ref IN ("+placeholders+")", args...).
+		Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	return total.Int64, nil
+}
+
 // invalidate publishes purged generations to the writer and forgets their
 // backfill state, so a gap or resume point recorded before the purge cannot
 // re-read the deleted window back out of the engine.
@@ -106,11 +129,15 @@ func (s *Store) invalidate(keys []genKey) {
 // dropInvalidated evicts purged generations from the writer's ref cache. The
 // writer calls it inside its write transaction, so the keys it drops are
 // exactly those of the deletions that already committed.
-func (s *Store) dropInvalidated(refs map[genKey]int64) {
+func (s *Store) dropInvalidated(state *writerState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for key := range s.invalidated {
-		delete(refs, key)
+		if ref, ok := state.refs[key]; ok {
+			delete(state.hot, ref)
+			delete(state.sealedMaxTS, ref)
+		}
+		delete(state.refs, key)
 		delete(s.invalidated, key)
 	}
 }

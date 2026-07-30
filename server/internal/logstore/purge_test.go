@@ -151,7 +151,7 @@ func TestDeleteContainerUnknown(t *testing.T) {
 func TestDeleteContainerInvalidatesWriterCache(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	refs := map[genKey]int64{}
+	state := mustWriterState(t, store)
 
 	web := genKey{"local", "aaa"}
 	commit := func(key genKey, name string, entries ...models.LogEntry) {
@@ -160,13 +160,13 @@ func TestDeleteContainerInvalidatesWriterCache(t *testing.T) {
 		for _, entry := range entries {
 			batch = append(batch, ingestMsg{kind: msgLine, key: key, name: name, line: lineFromEntry(entry)})
 		}
-		if err := store.commit(batch, refs); err != nil {
+		if err := store.commit(batch, state); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 	}
 
 	commit(web, "web", entryAt(baseTime, "stdout", "before purge"))
-	before := refs[web]
+	before := state.refs[web]
 	if before == 0 {
 		t.Fatal("the writer did not cache the live generation, so this test proves nothing")
 	}
@@ -183,7 +183,7 @@ func TestDeleteContainerInvalidatesWriterCache(t *testing.T) {
 	// generation of *web*, never under db.
 	commit(web, "web", entryAt(baseTime.Add(2*time.Second), "stdout", "after purge"))
 
-	if got := refs[web]; got == before {
+	if got := state.refs[web]; got == before {
 		t.Fatalf("the writer still caches the purged generation id %d", got)
 	}
 

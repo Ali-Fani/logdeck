@@ -61,9 +61,21 @@ func writeEntries(t *testing.T, s *Store, key genKey, name string, entries ...mo
 			line: lineFromEntry(entry),
 		})
 	}
-	if err := s.commit(batch, map[genKey]int64{}); err != nil {
+	if err := s.commit(batch, mustWriterState(t, s)); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+}
+
+// mustWriterState rebuilds the writer's between-batch state from the database,
+// so a helper that commits one batch continues the sequence numbering the store
+// already holds instead of restarting it.
+func mustWriterState(t *testing.T, s *Store) *writerState {
+	t.Helper()
+	state, err := s.loadWriterState()
+	if err != nil {
+		t.Fatalf("load writer state: %v", err)
+	}
+	return state
 }
 
 // markInitialBackfillDone models the ordered completion marker the writer
@@ -75,7 +87,7 @@ func markInitialBackfillDone(t *testing.T, s *Store, key genKey, name string) {
 		key:      key,
 		name:     name,
 		complete: true,
-	}}, map[genKey]int64{}); err != nil {
+	}}, mustWriterState(t, s)); err != nil {
 		t.Fatalf("mark initial backfill done: %v", err)
 	}
 }
@@ -1116,13 +1128,13 @@ func TestMigrationFromV1AddsTheForeignKey(t *testing.T) {
 
 // commitThrough writes a batch through the writer's own generation-id cache,
 // the way writeLoop does across batches.
-func commitThrough(t *testing.T, s *Store, refs map[genKey]int64, key genKey, name string, entries ...models.LogEntry) {
+func commitThrough(t *testing.T, s *Store, state *writerState, key genKey, name string, entries ...models.LogEntry) {
 	t.Helper()
 	batch := make([]ingestMsg, 0, len(entries))
 	for _, entry := range entries {
 		batch = append(batch, ingestMsg{kind: msgLine, key: key, name: name, line: lineFromEntry(entry)})
 	}
-	if err := s.commit(batch, refs); err != nil {
+	if err := s.commit(batch, state); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 }
@@ -1138,7 +1150,7 @@ func commitThrough(t *testing.T, s *Store, refs map[genKey]int64, key genKey, na
 func TestFailedCommitDoesNotPoisonTheRefCache(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	refs := map[genKey]int64{} // the writer's cache, alive across batches
+	state := mustWriterState(t, store) // the writer's cache, alive across batches
 	alpha := genKey{"local", "container-a"}
 	beta := genKey{"local", "container-b"}
 
@@ -1153,11 +1165,11 @@ func TestFailedCommitDoesNotPoisonTheRefCache(t *testing.T) {
 		kind: msgLine, key: alpha, name: "alpha",
 		line: lineFromEntry(entryAt(baseTime, "stdout", "alpha line 1")),
 	}}
-	if err := store.commit(batch, refs); err == nil {
+	if err := store.commit(batch, state); err == nil {
 		t.Fatal("the batch must fail while the trigger is installed")
 	}
-	if len(refs) != 0 {
-		t.Fatalf("a rolled-back transaction published %v into the ref cache: SQLite reuses that rowid", refs)
+	if len(state.refs) != 0 {
+		t.Fatalf("a rolled-back transaction published %v into the ref cache: SQLite reuses that rowid", state.refs)
 	}
 	if _, err := store.db.Exec("DROP TRIGGER fail_writes"); err != nil {
 		t.Fatalf("drop trigger: %v", err)
@@ -1165,9 +1177,9 @@ func TestFailedCommitDoesNotPoisonTheRefCache(t *testing.T) {
 
 	// A different container is created next and takes the rowid the rolled-back
 	// row had been handed.
-	commitThrough(t, store, refs, beta, "beta", entryAt(baseTime.Add(time.Second), "stdout", "beta line 1"))
+	commitThrough(t, store, state, beta, "beta", entryAt(baseTime.Add(time.Second), "stdout", "beta line 1"))
 	// alpha writes again, through the same cache.
-	commitThrough(t, store, refs, alpha, "alpha", entryAt(baseTime.Add(2*time.Second), "stdout", "alpha line 2"))
+	commitThrough(t, store, state, alpha, "alpha", entryAt(baseTime.Add(2*time.Second), "stdout", "alpha line 2"))
 
 	page, err := store.Query(ctx, LogQuery{Container: "beta"})
 	if err != nil {

@@ -164,10 +164,14 @@ type lineSpan struct {
 	newest time.Time
 }
 
-// lineSpans reports the stored time range of every generation that has lines.
+// lineSpans reports the stored time range of every generation that has lines,
+// covering both the hot table and the sealed blocks. A block's bounds are stored
+// alongside it, so the full range costs no decompression.
 func (s *Store) lineSpans(ctx context.Context) (map[int64]lineSpan, error) {
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT container_ref, MIN(ts_ns), MAX(ts_ns) FROM log_lines GROUP BY container_ref")
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT container_ref, MIN(ts_ns), MAX(ts_ns) FROM log_lines GROUP BY container_ref
+		UNION ALL
+		SELECT container_ref, MIN(ts_min_ns), MAX(ts_max_ns) FROM log_blocks GROUP BY container_ref`)
 	if err != nil {
 		return nil, err
 	}
@@ -179,10 +183,14 @@ func (s *Store) lineSpans(ctx context.Context) (map[int64]lineSpan, error) {
 		if err := rows.Scan(&ref, &oldest, &newest); err != nil {
 			return nil, err
 		}
-		spans[ref] = lineSpan{
-			oldest: time.Unix(0, oldest).UTC(),
-			newest: time.Unix(0, newest).UTC(),
+		span, seen := spans[ref]
+		if !seen || time.Unix(0, oldest).UTC().Before(span.oldest) {
+			span.oldest = time.Unix(0, oldest).UTC()
 		}
+		if !seen || time.Unix(0, newest).UTC().After(span.newest) {
+			span.newest = time.Unix(0, newest).UTC()
+		}
+		spans[ref] = span
 	}
 	return spans, rows.Err()
 }
@@ -235,11 +243,11 @@ func (s *Store) Query(ctx context.Context, q LogQuery) (LogPage, error) {
 		hasPos bool
 	)
 	if q.Cursor != "" {
-		tsNS, rowid, err := decodeCursor(q.Cursor)
+		tsNS, seq, err := decodeCursor(q.Cursor)
 		if err != nil {
 			return LogPage{}, err
 		}
-		from, hasPos = cursorPos{tsNS: tsNS, rowid: rowid}, true
+		from, hasPos = cursorPos{tsNS: tsNS, seq: seq}, true
 	}
 
 	// One extra entry beyond the page is what proves an older page exists, and
@@ -318,14 +326,25 @@ func newPage(entries []models.LogEntry, anchors []cursorPos, limit int) LogPage 
 	cut := len(entries) - limit
 	return LogPage{
 		Entries:    entries[cut:],
-		NextCursor: encodeCursor(anchors[cut].tsNS, anchors[cut].rowid),
+		NextCursor: encodeCursor(anchors[cut].tsNS, anchors[cut].seq),
 	}
 }
 
-// cursorPos is the keyset position of one stored row.
+// cursorPos is the keyset position of one stored line: its timestamp and its
+// store-wide sequence number. seq keeps the position stable when the line moves
+// from the hot table into a sealed block, where it no longer has a rowid.
 type cursorPos struct {
-	tsNS  int64
-	rowid int64
+	tsNS int64
+	seq  int64
+}
+
+// newer reports whether p sorts before other in the newest-first order pages
+// are read in.
+func (p cursorPos) newer(other cursorPos) bool {
+	if p.tsNS != other.tsNS {
+		return p.tsNS > other.tsNS
+	}
+	return p.seq > other.seq
 }
 
 // storedRow is one scanned row: the entry it parses to and where it sits.
@@ -334,8 +353,38 @@ type storedRow struct {
 	pos   cursorPos
 }
 
-// scanRows reads one chunk of rows, newest-first, strictly older than from.
+// scanRows reads one chunk of lines, newest-first, strictly older than from.
+//
+// Lines live in two places — the hot table holds what has not been sealed yet,
+// sealed blocks hold everything older — and a generation's hot lines are not
+// always newer than another generation's sealed ones. So both sources are read
+// and merged. Taking the newest chunk of the union is exact: each source
+// contributed its own newest chunk, so nothing that belongs in the result was
+// left behind.
 func (s *Store) scanRows(ctx context.Context, refs []int64, q LogQuery, from cursorPos, hasPos bool, chunk int, byRef map[int64]generation) ([]storedRow, error) {
+	hot, err := s.scanHotRows(ctx, refs, q, from, hasPos, chunk, byRef)
+	if err != nil {
+		return nil, err
+	}
+	sealed, err := s.scanSealedRows(ctx, refs, q, from, hasPos, chunk, byRef)
+	if err != nil {
+		return nil, err
+	}
+
+	merged := make([]storedRow, 0, len(hot)+len(sealed))
+	merged = append(merged, hot...)
+	merged = append(merged, sealed...)
+	sort.SliceStable(merged, func(i, j int) bool {
+		return merged[i].pos.newer(merged[j].pos)
+	})
+	if len(merged) > chunk {
+		merged = merged[:chunk]
+	}
+	return merged, nil
+}
+
+// scanHotRows reads unsealed lines straight out of log_lines.
+func (s *Store) scanHotRows(ctx context.Context, refs []int64, q LogQuery, from cursorPos, hasPos bool, chunk int, byRef map[int64]generation) ([]storedRow, error) {
 	statement, args := buildSelect(refs, q, from, hasPos, chunk)
 
 	rows, err := s.db.QueryContext(ctx, statement, args...)
@@ -347,21 +396,99 @@ func (s *Store) scanRows(ctx context.Context, refs []int64, q LogQuery, from cur
 	scanned := make([]storedRow, 0, chunk)
 	for rows.Next() {
 		var (
-			rowid  int64
+			seq    int64
 			ref    int64
 			tsNS   int64
 			stream int
 			raw    string
 		)
-		if err := rows.Scan(&rowid, &ref, &tsNS, &stream, &raw); err != nil {
+		if err := rows.Scan(&seq, &ref, &tsNS, &stream, &raw); err != nil {
 			return nil, err
 		}
 		scanned = append(scanned, storedRow{
 			entry: entryFromRow(tsNS, stream, raw, byRef[ref]),
-			pos:   cursorPos{tsNS: tsNS, rowid: rowid},
+			pos:   cursorPos{tsNS: tsNS, seq: seq},
 		})
 	}
 	return scanned, rows.Err()
+}
+
+// scanSealedRows reads compressed blocks newest-first, stopping as soon as it
+// holds a full chunk of lines. Blocks outside the query's time window, or
+// entirely newer than the cursor, are ruled out by their stored bounds and are
+// never decompressed.
+func (s *Store) scanSealedRows(ctx context.Context, refs []int64, q LogQuery, from cursorPos, hasPos bool, chunk int, byRef map[int64]generation) ([]storedRow, error) {
+	placeholders, args := refArgs(refs)
+	where := []string{"container_ref IN (" + placeholders + ")"}
+	if !q.Since.IsZero() {
+		where = append(where, "ts_max_ns >= ?")
+		args = append(args, q.Since.UnixNano())
+	}
+	if !q.Until.IsZero() {
+		where = append(where, "ts_min_ns <= ?")
+		args = append(args, q.Until.UnixNano())
+	}
+	if hasPos {
+		// A block every one of whose lines is newer than the cursor holds
+		// nothing this page can use.
+		where = append(where, "(ts_min_ns < ? OR (ts_min_ns = ? AND seq_min < ?))")
+		args = append(args, from.tsNS, from.tsNS, from.seq)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT container_ref, payload FROM log_blocks WHERE "+strings.Join(where, " AND ")+
+			" ORDER BY ts_max_ns DESC, seq_max DESC", args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var (
+		scanned []storedRow
+		scratch []byte
+	)
+	for rows.Next() {
+		var (
+			ref     int64
+			payload []byte
+		)
+		if err := rows.Scan(&ref, &payload); err != nil {
+			return nil, err
+		}
+		lines, next, err := s.codec.unpack(payload, scratch)
+		if err != nil {
+			return nil, err
+		}
+		scratch = next
+
+		gen := byRef[ref]
+		for i := len(lines) - 1; i >= 0; i-- { // newest-first within the block
+			l := lines[i]
+			pos := cursorPos{tsNS: l.tsNS, seq: l.seq}
+			if hasPos && !from.newer(pos) {
+				continue
+			}
+			if !q.Since.IsZero() && l.tsNS < q.Since.UnixNano() {
+				continue
+			}
+			if !q.Until.IsZero() && l.tsNS > q.Until.UnixNano() {
+				continue
+			}
+			scanned = append(scanned, storedRow{
+				entry: entryFromRow(l.tsNS, l.stream, l.raw, gen),
+				pos:   pos,
+			})
+		}
+		// Blocks arrive newest-first, so once a chunk is full every line still
+		// unread is older than what has been collected.
+		if len(scanned) >= chunk {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return scanned, nil
 }
 
 // generations resolves a logical container name to its generation rows. An
@@ -412,14 +539,14 @@ func buildSelect(refs []int64, q LogQuery, from cursorPos, hasPos bool, chunk in
 		args = append(args, q.Until.UnixNano())
 	}
 	if hasPos {
-		where = append(where, "(ts_ns < ? OR (ts_ns = ? AND rowid < ?))")
-		args = append(args, from.tsNS, from.tsNS, from.rowid)
+		where = append(where, "(ts_ns < ? OR (ts_ns = ? AND seq < ?))")
+		args = append(args, from.tsNS, from.tsNS, from.seq)
 	}
 	args = append(args, chunk)
 
-	statement := "SELECT rowid, container_ref, ts_ns, stream, raw FROM log_lines WHERE " +
+	statement := "SELECT seq, container_ref, ts_ns, stream, raw FROM log_lines WHERE " +
 		strings.Join(where, " AND ") +
-		" ORDER BY ts_ns DESC, rowid DESC LIMIT ?"
+		" ORDER BY ts_ns DESC, seq DESC LIMIT ?"
 	return statement, args
 }
 
@@ -552,10 +679,11 @@ func groupRows(rows []storedRow) ([]models.LogEntry, []cursorPos, int) {
 }
 
 // encodeCursor renders the keyset position of the oldest entry on a page.
-// (ts_ns, rowid) is unique and immutable, so pages stay stable while new lines
-// are ingested.
-func encodeCursor(tsNS, rowid int64) string {
-	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "%d:%d", tsNS, rowid))
+// (ts_ns, seq) is unique and immutable — a line keeps its sequence number when
+// it is sealed into a block — so pages stay stable while new lines are ingested
+// and while older ones are compressed.
+func encodeCursor(tsNS, seq int64) string {
+	return base64.RawURLEncoding.EncodeToString(fmt.Appendf(nil, "%d:%d", tsNS, seq))
 }
 
 func decodeCursor(cursor string) (int64, int64, error) {
@@ -563,7 +691,7 @@ func decodeCursor(cursor string) (int64, int64, error) {
 	if err != nil {
 		return 0, 0, ErrInvalidCursor
 	}
-	tsPart, rowPart, ok := strings.Cut(string(decoded), ":")
+	tsPart, seqPart, ok := strings.Cut(string(decoded), ":")
 	if !ok {
 		return 0, 0, ErrInvalidCursor
 	}
@@ -571,9 +699,9 @@ func decodeCursor(cursor string) (int64, int64, error) {
 	if err != nil {
 		return 0, 0, ErrInvalidCursor
 	}
-	rowid, err := strconv.ParseInt(rowPart, 10, 64)
+	seq, err := strconv.ParseInt(seqPart, 10, 64)
 	if err != nil {
 		return 0, 0, ErrInvalidCursor
 	}
-	return tsNS, rowid, nil
+	return tsNS, seq, nil
 }

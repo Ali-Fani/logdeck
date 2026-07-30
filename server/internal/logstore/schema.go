@@ -8,7 +8,7 @@ import (
 
 // schemaVersion is the current schema generation, tracked in PRAGMA
 // user_version. Bump it and add a migration step when the schema changes.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // schemaV1 is the initial schema.
 //
@@ -87,6 +87,50 @@ ALTER TABLE containers
 ADD COLUMN initial_backfill_done INTEGER NOT NULL DEFAULT 0;
 `
 
+// schemaV4 adds sealed blocks. log_lines stays exactly as it was and becomes
+// the hot table: lines land there first so they are queryable the moment they
+// commit, and the writer seals each full run of blockLines into one compressed
+// row of log_blocks. A container therefore holds at most blockLines uncompressed
+// lines at a time, and everything older costs roughly a tenth as much disk.
+//
+// seq is a store-wide monotonic line number. It orders lines that share a
+// timestamp, and it keeps doing so after a line moves into a block, where its
+// rowid no longer exists — which is what lets one keyset cursor page across both
+// tables. Existing rows adopt their rowid, which is already insertion-ordered
+// and unique within the table.
+//
+// stored_bytes changes meaning here, from "raw log bytes" to "bytes this
+// generation occupies", so the retention caps keep bounding the file rather
+// than the history. Existing rows are already counted in raw bytes and are
+// still hot, so they need no restatement; sealing subtracts the raw bytes it
+// removes and adds the payload it writes.
+const schemaV4 = `
+ALTER TABLE log_lines ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+UPDATE log_lines SET seq = rowid;
+
+DROP INDEX log_lines_container_ts;
+CREATE INDEX log_lines_container_ts ON log_lines(container_ref, ts_ns, seq);
+
+CREATE TABLE log_blocks (
+  container_ref INTEGER NOT NULL REFERENCES containers(id),
+  ts_min_ns     INTEGER NOT NULL,
+  ts_max_ns     INTEGER NOT NULL,
+  seq_min       INTEGER NOT NULL,
+  seq_max       INTEGER NOT NULL,
+  lines         INTEGER NOT NULL,
+  -- level_mask carries one bit per severity and raw_bytes the uncompressed
+  -- size, so a level filter and the history summary both work without
+  -- decompressing anything.
+  level_mask    INTEGER NOT NULL,
+  raw_bytes     INTEGER NOT NULL,
+  -- dedup_filter rules out lines a backfill re-read has already stored; see
+  -- block.go.
+  dedup_filter  BLOB NOT NULL,
+  payload       BLOB NOT NULL
+);
+CREATE INDEX log_blocks_container_ts ON log_blocks(container_ref, ts_max_ns);
+`
+
 // initSchema creates the schema on a fresh database and is a no-op on an
 // already-current one. Unknown (newer) versions are rejected rather than
 // silently downgraded. A fresh database walks the same migration path as an
@@ -123,6 +167,11 @@ func initSchema(ctx context.Context, db *sql.DB) error {
 	if version < 3 {
 		if _, err := tx.ExecContext(ctx, schemaV3); err != nil {
 			return fmt.Errorf("migrate schema to version 3: %w", err)
+		}
+	}
+	if version < 4 {
+		if _, err := tx.ExecContext(ctx, schemaV4); err != nil {
+			return fmt.Errorf("migrate schema to version 4: %w", err)
 		}
 	}
 
