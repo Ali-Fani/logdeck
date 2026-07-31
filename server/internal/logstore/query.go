@@ -436,8 +436,8 @@ func (s *Store) scanSealedRows(ctx context.Context, refs []int64, q LogQuery, fr
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT container_ref, payload FROM log_blocks WHERE "+strings.Join(where, " AND ")+
-			" ORDER BY ts_max_ns DESC, seq_max DESC", args...)
+		"SELECT container_ref, ts_max_ns, seq_max, payload FROM log_blocks WHERE "+
+			strings.Join(where, " AND ")+" ORDER BY ts_max_ns DESC, seq_max DESC", args...)
 	if err != nil {
 		return nil, err
 	}
@@ -450,11 +450,30 @@ func (s *Store) scanSealedRows(ctx context.Context, refs []int64, q LogQuery, fr
 	for rows.Next() {
 		var (
 			ref     int64
+			tsMax   int64
+			seqMax  int64
 			payload []byte
 		)
-		if err := rows.Scan(&ref, &payload); err != nil {
+		if err := rows.Scan(&ref, &tsMax, &seqMax, &payload); err != nil {
 			return nil, err
 		}
+
+		// Blocks arrive ordered by their newest line, but a backfill re-read
+		// makes their time ranges overlap, so a later block can still hold lines
+		// newer than ones already collected. Stopping on count alone would drop
+		// those, and the cursor would then page straight past them. Stop only
+		// once this block's newest possible position is older than the chunk
+		// boundary, which is the point nothing further can qualify.
+		if len(scanned) >= chunk {
+			sort.SliceStable(scanned, func(i, j int) bool {
+				return scanned[i].pos.newer(scanned[j].pos)
+			})
+			scanned = scanned[:chunk]
+			if !(cursorPos{tsNS: tsMax, seq: seqMax}).newer(scanned[chunk-1].pos) {
+				break
+			}
+		}
+
 		lines, next, err := s.codec.unpack(payload, scratch)
 		if err != nil {
 			return nil, err
@@ -478,11 +497,6 @@ func (s *Store) scanSealedRows(ctx context.Context, refs []int64, q LogQuery, fr
 				entry: entryFromRow(l.tsNS, l.stream, l.raw, gen),
 				pos:   pos,
 			})
-		}
-		// Blocks arrive newest-first, so once a chunk is full every line still
-		// unread is older than what has been collected.
-		if len(scanned) >= chunk {
-			break
 		}
 	}
 	if err := rows.Err(); err != nil {

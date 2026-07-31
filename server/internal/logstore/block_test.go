@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,14 +78,21 @@ func noisy(n int, ts time.Time) []models.LogEntry {
 // readAll pages through a container's whole stored history, oldest first.
 func readAll(t *testing.T, s *Store, host, name string) []models.LogEntry {
 	t.Helper()
+	return pageAll(t, s, host, name, 200)
+}
+
+// pageAll is readAll with an explicit page size, so a test can force the cursor
+// to land inside a sealed block rather than between blocks.
+func pageAll(t *testing.T, s *Store, host, name string, limit int) []models.LogEntry {
+	t.Helper()
 	var all []models.LogEntry
 	cursor := ""
 	for round := 0; ; round++ {
-		if round > 500 {
+		if round > 5000 {
 			t.Fatal("paging did not terminate")
 		}
 		page, err := s.Query(context.Background(), LogQuery{
-			Host: host, Container: name, Limit: 200, Cursor: cursor,
+			Host: host, Container: name, Limit: limit, Cursor: cursor,
 		})
 		if err != nil {
 			t.Fatalf("Query: %v", err)
@@ -521,6 +529,108 @@ func TestMigrationFromV3SealsNothingAndKeepsEveryLine(t *testing.T) {
 	for i := range want {
 		if got[i].Raw != want[i] {
 			t.Fatalf("migrated line %d is %q, want %q", i, got[i].Raw, want[i])
+		}
+	}
+}
+
+// TestSealingHandlesOutOfOrderArrival is the case a backfill produces: the
+// store persists live history, then re-reads an older window from the engine, so
+// lines arrive with older timestamps but newer sequence numbers.
+//
+// Two things have to cope with that. A single block can hold a mix of both, so
+// its stored sequence range is not simply its first and last line. And sealed
+// blocks then overlap in time, so reading them newest-first by their end
+// timestamp does not yield lines in timestamp order.
+func TestSealingHandlesOutOfOrderArrival(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "api-1"}
+
+	// Live history, not yet a full block.
+	live := chatty(600, baseTime, dockerEntry)
+	writeAndSeal(t, store, key, "api", live...)
+
+	// A backfill of the window *before* it, arriving later and so carrying
+	// larger sequence numbers. This fills the block, and the block it seals
+	// holds both.
+	backfill := make([]models.LogEntry, 0, 600)
+	for i := range 600 {
+		at := baseTime.Add(-time.Duration(600-i) * time.Second)
+		backfill = append(backfill, dockerEntry(at, "stdout", fmt.Sprintf("BACKFILL record %d", i)))
+	}
+	writeAndSeal(t, store, key, "api", backfill...)
+
+	if blocks := countRows(t, store, "SELECT COUNT(*) FROM log_blocks"); blocks == 0 {
+		t.Fatal("nothing was sealed, so this test proves nothing")
+	}
+
+	// A block's stored sequence range must bracket every sequence it holds: the
+	// keyset cursor uses that range to include or skip the block.
+	rows, err := store.db.Query("SELECT rowid, seq_min, seq_max FROM log_blocks")
+	if err != nil {
+		t.Fatalf("read blocks: %v", err)
+	}
+	for rows.Next() {
+		var rowid, seqMin, seqMax int64
+		if err := rows.Scan(&rowid, &seqMin, &seqMax); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		if seqMin > seqMax {
+			t.Errorf("block %d stores an inverted sequence range [%d, %d]", rowid, seqMin, seqMax)
+		}
+	}
+	rows.Close()
+
+	want := len(live) + len(backfill)
+	for _, limit := range []int{7, 37, 200} {
+		got := pageAll(t, store, "local", "api", limit)
+		if len(got) != want {
+			t.Fatalf("paging %d at a time returned %d lines, want %d", limit, len(got), want)
+		}
+		for i := 1; i < len(got); i++ {
+			if got[i].Timestamp.Before(got[i-1].Timestamp) {
+				t.Fatalf("paging %d at a time is out of timestamp order at %d: %v before %v",
+					limit, i, got[i].Timestamp, got[i-1].Timestamp)
+			}
+		}
+	}
+}
+
+// TestBlocksAreCappedByBytesAsWellAsLines covers the guard that keeps a
+// container logging very long lines from building a block too large to read
+// back: the block seals on size before it reaches blockLines.
+func TestBlocksAreCappedByBytesAsWellAsLines(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "api-1"}
+
+	// 16 KiB a line, so the byte cap is reached well inside one block.
+	body := strings.Repeat("x", 16*1024)
+	entries := make([]models.LogEntry, 0, blockLines)
+	for i := range blockLines {
+		at := baseTime.Add(time.Duration(i) * time.Second)
+		entries = append(entries, dockerEntry(at, "stdout", fmt.Sprintf("%d %s", i, body)))
+	}
+	writeAndSeal(t, store, key, "api", entries...)
+
+	var blocks, maxRaw int
+	if err := store.db.QueryRow(
+		"SELECT COUNT(*), COALESCE(MAX(raw_bytes), 0) FROM log_blocks").Scan(&blocks, &maxRaw); err != nil {
+		t.Fatalf("read blocks: %v", err)
+	}
+	if blocks == 0 {
+		t.Fatal("the byte cap never sealed a block")
+	}
+	if int64(maxRaw) > maxBlockRawBytes {
+		t.Fatalf("a block holds %d bytes, past the %d byte cap", maxRaw, maxBlockRawBytes)
+	}
+
+	got := readAll(t, store, "local", "api")
+	if len(got) != len(entries) {
+		t.Fatalf("read back %d lines, want %d", len(got), len(entries))
+	}
+	for i := range entries {
+		if got[i].Raw != entries[i].Raw {
+			t.Fatalf("line %d did not survive the round trip", i)
 		}
 	}
 }

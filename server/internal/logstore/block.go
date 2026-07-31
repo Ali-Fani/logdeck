@@ -59,6 +59,15 @@ type blockCodec struct {
 // hold far more state than the store ever needs.
 const blockWindow = 1 << 20 // 1 MiB
 
+// maxBlockRawBytes caps how much log text one block may hold, whatever the line
+// count. Without it a thousand very long lines would serialize past the
+// decoder's budget below, and the block would be written but never readable
+// again. decoderBudget leaves generous headroom above that cap.
+const (
+	maxBlockRawBytes = 8 << 20  // 8 MiB
+	decoderBudget    = 64 << 20 // 64 MiB
+)
+
 func newBlockCodec() (*blockCodec, error) {
 	// Both defaults scale their internal state with GOMAXPROCS, which on a
 	// many-core host reserves hundreds of megabytes for a store whose whole
@@ -75,7 +84,7 @@ func newBlockCodec() (*blockCodec, error) {
 	}
 	dec, err := zstd.NewReader(nil,
 		zstd.WithDecoderConcurrency(maxDBConns),
-		zstd.WithDecoderMaxMemory(blockWindow*16),
+		zstd.WithDecoderMaxMemory(decoderBudget),
 	)
 	if err != nil {
 		enc.Close()
@@ -118,11 +127,15 @@ func (c *blockCodec) pack(lines []sealedLine) (payload, filter []byte, summary b
 		return nil, nil, blockSummary{}, fmt.Errorf("pack empty log block")
 	}
 
+	// Lines are ordered by timestamp, but sequence numbers are handed out in
+	// arrival order, so a backfill re-read puts older timestamps on larger
+	// sequences. The block's sequence range therefore has to be the real
+	// extremes: the keyset cursor uses it to include or skip this block.
 	summary = blockSummary{
 		tsMinNS: lines[0].tsNS,
 		tsMaxNS: lines[len(lines)-1].tsNS,
 		seqMin:  lines[0].seq,
-		seqMax:  lines[len(lines)-1].seq,
+		seqMax:  lines[0].seq,
 		lines:   len(lines),
 	}
 
@@ -133,6 +146,8 @@ func (c *blockCodec) pack(lines []sealedLine) (payload, filter []byte, summary b
 	for i, l := range lines {
 		summary.levelMask |= 1 << uint(l.level)
 		summary.rawBytes += int64(len(l.raw))
+		summary.seqMin = min(summary.seqMin, l.seq)
+		summary.seqMax = max(summary.seqMax, l.seq)
 		if body, ok := stripTimestamp(l.raw, l.tsNS); ok {
 			bodies[i] = body
 			continue
@@ -156,9 +171,14 @@ func (c *blockCodec) pack(lines []sealedLine) (payload, filter []byte, summary b
 		buf = binary.AppendVarint(buf, l.seq-prevSeq)
 		prevSeq = l.seq
 	}
+	// Each field gets its own run. Packing stream and level into one byte would
+	// cap severity at 15 and truncate silently past it, and a run of one
+	// repeated value compresses to almost nothing anyway.
 	for _, l := range lines {
-		// stream and level both fit in one byte and always travel together.
-		buf = append(buf, byte(l.stream)<<4|byte(l.level&0x0f))
+		buf = append(buf, byte(l.stream))
+	}
+	for _, l := range lines {
+		buf = append(buf, byte(l.level))
 	}
 	buf = append(buf, verbatim...)
 	for _, body := range bodies {
@@ -168,6 +188,10 @@ func (c *blockCodec) pack(lines []sealedLine) (payload, filter []byte, summary b
 		buf = append(buf, body...)
 	}
 
+	if int64(len(buf)) > decoderBudget {
+		return nil, nil, blockSummary{}, fmt.Errorf(
+			"log block serializes to %d bytes, past the %d byte decoder budget", len(buf), decoderBudget)
+	}
 	return c.enc.EncodeAll(buf, nil), buildDedupFilter(lines), summary, nil
 }
 
@@ -201,9 +225,10 @@ func (c *blockCodec) unpack(payload []byte, scratch []byte) ([]sealedLine, []byt
 		lines[i].seq = prevSeq
 	}
 	for i := range lines {
-		packed := r.byteAt()
-		lines[i].stream = int(packed >> 4)
-		lines[i].level = int(packed & 0x0f)
+		lines[i].stream = int(r.byteAt())
+	}
+	for i := range lines {
+		lines[i].level = int(r.byteAt())
 	}
 	verbatim := make([]byte, count)
 	for i := range verbatim {

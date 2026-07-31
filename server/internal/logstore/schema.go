@@ -129,6 +129,9 @@ CREATE TABLE log_blocks (
   payload       BLOB NOT NULL
 );
 CREATE INDEX log_blocks_container_ts ON log_blocks(container_ref, ts_max_ns);
+-- The writer reads MAX(seq_max) at startup; without this it scans the table,
+-- and every row it touches drags a compressed payload's pages with it.
+CREATE INDEX log_blocks_seq ON log_blocks(seq_max);
 `
 
 // initSchema creates the schema on a fresh database and is a no-op on an

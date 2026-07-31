@@ -484,49 +484,52 @@ func (s *Store) sealedHasLine(ctx context.Context, tx *sql.Tx, state *writerStat
 		return false, nil
 	}
 
+	// The payload is deliberately not selected here. This runs once per line of a
+	// backfill re-read, and reading a block's compressed blob is far more
+	// expensive than testing its filter; only the survivors are worth fetching.
 	rows, err := tx.QueryContext(ctx, `
-		SELECT rowid, dedup_filter, payload FROM log_blocks
+		SELECT rowid, dedup_filter FROM log_blocks
 		WHERE container_ref = ? AND ts_min_ns <= ? AND ts_max_ns >= ?`,
 		ref, l.tsNS, l.tsNS)
 	if err != nil {
 		return false, err
 	}
 
-	type candidate struct {
-		rowid   int64
-		payload []byte
-	}
-	var candidates []candidate
+	var candidates []int64
 	key := lineKey(l.tsNS, l.stream, l.raw)
 	for rows.Next() {
 		var (
-			rowid   int64
-			filter  []byte
-			payload []byte
+			rowid  int64
+			filter []byte
 		)
-		if err := rows.Scan(&rowid, &filter, &payload); err != nil {
+		if err := rows.Scan(&rowid, &filter); err != nil {
 			rows.Close()
 			return false, err
 		}
 		if !filterMayContain(filter, key) {
 			continue
 		}
-		candidates = append(candidates, candidate{rowid: rowid, payload: payload})
+		candidates = append(candidates, rowid)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
 
-	for _, c := range candidates {
+	for _, rowid := range candidates {
 		lines := state.unpacked
-		if state.unpackedRowid != c.rowid {
+		if state.unpackedRowid != rowid {
+			var payload []byte
+			if err := tx.QueryRowContext(ctx,
+				"SELECT payload FROM log_blocks WHERE rowid = ?", rowid).Scan(&payload); err != nil {
+				return false, err
+			}
 			var err error
-			lines, state.scratch, err = s.codec.unpack(c.payload, state.scratch)
+			lines, state.scratch, err = s.codec.unpack(payload, state.scratch)
 			if err != nil {
 				return false, err
 			}
-			state.unpacked, state.unpackedRowid = lines, c.rowid
+			state.unpacked, state.unpackedRowid = lines, rowid
 		}
 		for _, sl := range lines {
 			if sl.tsNS == l.tsNS && sl.stream == l.stream && sl.raw == l.raw {
@@ -584,13 +587,25 @@ func (s *Store) sealOneBlock(ref int64, state *writerState) (int, error) {
 		return 0, err
 	}
 	lines := make([]sealedLine, 0, blockLines)
+	rawBytes := int64(0)
+	full := false
 	for rows.Next() {
 		var l sealedLine
 		if err := rows.Scan(&l.seq, &l.tsNS, &l.stream, &l.level, &l.raw); err != nil {
 			rows.Close()
 			return 0, err
 		}
+		// A block is also full once it holds enough text, so a container that
+		// logs very long lines cannot build one too large to read back. The
+		// line that would cross the cap starts the next block instead; a single
+		// line larger than the cap still gets a block of its own, and pack
+		// refuses anything the decoder could not read back.
+		if len(lines) > 0 && rawBytes+int64(len(l.raw)) > maxBlockRawBytes {
+			full = true
+			break
+		}
 		lines = append(lines, l)
+		rawBytes += int64(len(l.raw))
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -598,7 +613,7 @@ func (s *Store) sealOneBlock(ref int64, state *writerState) (int, error) {
 	}
 	// A partial run stays hot: sealing it would give up most of the compression,
 	// since a block earns its ratio from the lines it holds together.
-	if len(lines) < blockLines {
+	if !full && len(lines) < blockLines {
 		return 0, nil
 	}
 
