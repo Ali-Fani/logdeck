@@ -644,10 +644,13 @@ func (s *Store) sealOneBlock(ref int64, state *writerState) (int, error) {
 		return 0, err
 	}
 
+	// The filter counts too: eviction frees payload plus filter per block, so
+	// sealing must add exactly that or repeated seal/evict cycles drift
+	// stored_bytes away from what the generation actually occupies.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE containers
 		SET stored_bytes = max(0, stored_bytes - ? + ?)
-		WHERE id = ?`, summary.rawBytes, int64(len(payload)), ref); err != nil {
+		WHERE id = ?`, summary.rawBytes, int64(len(payload)+len(filter)), ref); err != nil {
 		return 0, err
 	}
 

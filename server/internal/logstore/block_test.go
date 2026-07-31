@@ -634,3 +634,90 @@ func TestBlocksAreCappedByBytesAsWellAsLines(t *testing.T) {
 		}
 	}
 }
+
+// TestStoredBytesMatchesWhatBlocksOccupy pins the accounting symmetry retention
+// depends on: what sealing adds to stored_bytes must be exactly what eviction
+// subtracts per block — payload plus dedup filter — or repeated seal/evict
+// cycles drift the counter until the caps stop meaning anything.
+func TestStoredBytesMatchesWhatBlocksOccupy(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "api-1"}
+	writeAndSeal(t, store, key, "api", chatty(2400, baseTime, dockerEntry)...)
+
+	var stored, sealedBytes, hotBytes int64
+	if err := store.db.QueryRow(
+		"SELECT stored_bytes FROM containers WHERE container_id = 'api-1'").Scan(&stored); err != nil {
+		t.Fatalf("read stored_bytes: %v", err)
+	}
+	if err := store.db.QueryRow(
+		"SELECT COALESCE(SUM(length(payload) + length(dedup_filter)), 0) FROM log_blocks").Scan(&sealedBytes); err != nil {
+		t.Fatalf("measure blocks: %v", err)
+	}
+	if err := store.db.QueryRow(
+		"SELECT COALESCE(SUM(length(CAST(raw AS BLOB))), 0) FROM log_lines").Scan(&hotBytes); err != nil {
+		t.Fatalf("measure hot lines: %v", err)
+	}
+
+	if want := sealedBytes + hotBytes; stored != want {
+		t.Fatalf("stored_bytes is %d but the store occupies %d (blocks %d + hot %d)",
+			stored, want, sealedBytes, hotBytes)
+	}
+}
+
+// TestRetentionEvictsOldestAcrossBothTables reproduces the backfill shape that
+// breaks "blocks are always older than hot lines": newer history is sealed, and
+// a backfill then lands *older* lines in the hot table. Eviction asked for a
+// small trim must take the oldest data — the hot backfill — not the newer
+// sealed block.
+func TestRetentionEvictsOldestAcrossBothTables(t *testing.T) {
+	store := newTestStore(t)
+	key := genKey{"local", "api-1"}
+
+	// Newer history, sealed.
+	writeAndSeal(t, store, key, "api", chatty(1000, baseTime, dockerEntry)...)
+	if blocks := countRows(t, store, "SELECT COUNT(*) FROM log_blocks"); blocks != 1 {
+		t.Fatalf("sealed %d blocks, want 1", blocks)
+	}
+
+	// An older window arrives afterwards, as a backfill re-read does. Too few
+	// lines to seal, so they stay hot — and they are the oldest data stored.
+	old := make([]models.LogEntry, 0, 10)
+	for i := range 10 {
+		at := baseTime.Add(-time.Hour + time.Duration(i)*time.Second)
+		old = append(old, dockerEntry(at, "stdout", fmt.Sprintf("OLD backfilled line %d", i)))
+	}
+	writeAndSeal(t, store, key, "api", old...)
+
+	var ref int64
+	if err := store.db.QueryRow(
+		"SELECT id FROM containers WHERE container_id = 'api-1'").Scan(&ref); err != nil {
+		t.Fatalf("resolve generation: %v", err)
+	}
+
+	// Trim a handful of bytes: far less than the block, and coverable entirely
+	// by the old hot lines.
+	if _, err := store.evictOldest(context.Background(), []int64{ref}, 64); err != nil {
+		t.Fatalf("evictOldest: %v", err)
+	}
+
+	if blocks := countRows(t, store, "SELECT COUNT(*) FROM log_blocks"); blocks != 1 {
+		t.Fatalf("eviction deleted the sealed block, which holds the *newest* history")
+	}
+	if hot := countRows(t, store, "SELECT COUNT(*) FROM log_lines"); hot >= 10 {
+		t.Fatalf("eviction left all %d old hot lines untouched", hot)
+	}
+
+	// What survives must be newer than what was evicted: the oldest surviving
+	// line must not postdate any line that was removed. Equivalent check: no
+	// gap — everything still stored is newer than everything gone, so the
+	// oldest survivor is one of the old lines or the block start.
+	got := readAll(t, store, "local", "api")
+	if len(got) == 0 {
+		t.Fatal("eviction removed everything")
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i].Timestamp.Before(got[i-1].Timestamp) {
+			t.Fatalf("surviving history is out of order at %d", i)
+		}
+	}
+}

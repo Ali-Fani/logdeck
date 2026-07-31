@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"strings"
 	"time"
 )
@@ -188,23 +189,50 @@ func (s *Store) oldestLine(ctx context.Context, refs []int64) (int64, bool, erro
 // evictOldest frees at least excess bytes from one logical container, oldest
 // first, and returns how many bytes it actually freed.
 //
-// Sealed blocks go first because they hold the older history: a generation's
-// hot lines are the ones it has not accumulated a full block of yet, so they
-// are its newest. Only once a generation has no blocks left does eviction fall
-// through to its hot lines, which is also the path a container too young to
-// have sealed anything takes.
+// Sealed blocks usually hold the older history, but not always: a backfill
+// re-read lands *older* lines in the hot table after newer history has been
+// sealed. So each round compares the two sources' oldest timestamps, evicts
+// from whichever is older, and bounds that sweep at the other source's oldest
+// data — one call can therefore never remove anything newer than what the
+// other table still holds. The caller loops until the excess is freed.
 func (s *Store) evictOldest(ctx context.Context, refs []int64, excess int64) (int64, error) {
-	freed, err := s.evictOldestBlocks(ctx, refs, excess)
-	if err != nil || freed > 0 {
-		return freed, err
+	placeholders, args := refArgs(refs)
+
+	var oldestHot, oldestBlock sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		"SELECT MIN(ts_ns) FROM log_lines WHERE container_ref IN ("+placeholders+")", args...).Scan(&oldestHot)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
 	}
-	return s.evictOldestHotLines(ctx, refs, excess)
+	err = s.db.QueryRowContext(ctx,
+		"SELECT MIN(ts_min_ns) FROM log_blocks WHERE container_ref IN ("+placeholders+")", args...).Scan(&oldestBlock)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+
+	const unbounded = int64(math.MaxInt64)
+	switch {
+	case oldestBlock.Valid && (!oldestHot.Valid || oldestBlock.Int64 <= oldestHot.Int64):
+		bound := unbounded
+		if oldestHot.Valid {
+			bound = oldestHot.Int64
+		}
+		return s.evictOldestBlocks(ctx, refs, excess, bound)
+	case oldestHot.Valid:
+		bound := unbounded
+		if oldestBlock.Valid {
+			bound = oldestBlock.Int64
+		}
+		return s.evictOldestHotLines(ctx, refs, excess, bound)
+	}
+	return 0, nil
 }
 
 // evictOldestBlocks deletes whole blocks, which is what makes retention cheap:
 // one row carries a thousand lines, so freeing a megabyte touches a handful of
-// rows instead of thousands.
-func (s *Store) evictOldestBlocks(ctx context.Context, refs []int64, excess int64) (int64, error) {
+// rows instead of thousands. Blocks starting after boundTS are left alone: the
+// hot table still holds older lines, and those must go first.
+func (s *Store) evictOldestBlocks(ctx context.Context, refs []int64, excess, boundTS int64) (int64, error) {
 	placeholders, args := refArgs(refs)
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -215,8 +243,9 @@ func (s *Store) evictOldestBlocks(ctx context.Context, refs []int64, excess int6
 
 	rows, err := tx.QueryContext(ctx,
 		"SELECT rowid, container_ref, length(payload) + length(dedup_filter) FROM log_blocks"+
-			" WHERE container_ref IN ("+placeholders+") ORDER BY ts_min_ns, seq_min LIMIT ?",
-		append(args, deleteChunk)...)
+			" WHERE container_ref IN ("+placeholders+") AND ts_min_ns <= ?"+
+			" ORDER BY ts_min_ns, seq_min LIMIT ?",
+		append(args, boundTS, deleteChunk)...)
 	if err != nil {
 		return 0, err
 	}
@@ -277,7 +306,10 @@ func (s *Store) evictOldestBlocks(ctx context.Context, refs []int64, excess int6
 // as a deferred read-then-write transaction it would fail with
 // SQLITE_BUSY_SNAPSHOT whenever a line was ingested between its SELECT and its
 // DELETE, so retention would stop working exactly when the store is busiest.
-func (s *Store) evictOldestHotLines(ctx context.Context, refs []int64, excess int64) (int64, error) {
+//
+// Lines after boundTS are left alone: a sealed block still holds older history,
+// and that must go first.
+func (s *Store) evictOldestHotLines(ctx context.Context, refs []int64, excess, boundTS int64) (int64, error) {
 	placeholders, args := refArgs(refs)
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -288,8 +320,9 @@ func (s *Store) evictOldestHotLines(ctx context.Context, refs []int64, excess in
 
 	rows, err := tx.QueryContext(ctx,
 		"SELECT rowid, container_ref, length(CAST(raw AS BLOB)) FROM log_lines"+
-			" WHERE container_ref IN ("+placeholders+") ORDER BY ts_ns, rowid LIMIT ?",
-		append(args, deleteChunk)...)
+			" WHERE container_ref IN ("+placeholders+") AND ts_ns <= ?"+
+			" ORDER BY ts_ns, rowid LIMIT ?",
+		append(args, boundTS, deleteChunk)...)
 	if err != nil {
 		return 0, err
 	}
