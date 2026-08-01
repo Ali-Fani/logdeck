@@ -94,6 +94,9 @@ type Store struct {
 	db     *sql.DB
 	path   string
 	limits Limits
+	// codec packs and unpacks sealed blocks. Its encoder and decoder are safe
+	// for concurrent use, so the writer and every reader share one.
+	codec *blockCodec
 
 	ingestCh chan ingestMsg
 	// retainCh signals the writer to run a retention sweep between batches. It is
@@ -214,10 +217,17 @@ func Open(path string, limits Limits) (*Store, error) {
 		return nil, err
 	}
 
+	codec, err := newBlockCodec()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return &Store{
 		db:          db,
 		path:        path,
 		limits:      limits,
+		codec:       codec,
 		ingestCh:    make(chan ingestMsg, ingestBuffer),
 		retainCh:    make(chan struct{}, 1),
 		resume:      make(map[genKey]resumePoint),
@@ -488,6 +498,7 @@ func (s *Store) Wait() {
 
 // Close releases the database. Call it after Wait.
 func (s *Store) Close() error {
+	s.codec.close()
 	return s.db.Close()
 }
 

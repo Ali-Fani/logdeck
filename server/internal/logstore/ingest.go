@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/AmoabaKelvin/logdeck/internal/models"
@@ -77,11 +78,109 @@ func lineFromEntry(entry models.LogEntry) line {
 	}
 }
 
+// writerState is everything the single writer goroutine remembers between
+// batches. None of it is shared, so none of it is locked.
+type writerState struct {
+	// refs maps a generation to its containers.id.
+	refs map[genKey]int64
+	// hot counts each generation's unsealed lines, so the writer knows when a
+	// full block's worth has accumulated without counting rows every batch.
+	hot map[int64]int
+	// sealedMaxTS is the newest timestamp each generation has already sealed.
+	// A line newer than that cannot collide with a sealed block, which is what
+	// keeps live ingestion from querying log_blocks at all.
+	sealedMaxTS map[int64]int64
+	// nextSeq hands out the store-wide monotonic line number.
+	nextSeq int64
+	// unpacked caches the most recently decompressed block, held only for the
+	// span of one commit. A backfill re-read walks forward through time, so
+	// consecutive lines usually land in the same block.
+	unpacked      []sealedLine
+	unpackedRowid int64
+	scratch       []byte
+}
+
+func newWriterState() *writerState {
+	return &writerState{
+		refs:          make(map[genKey]int64),
+		hot:           make(map[int64]int),
+		sealedMaxTS:   make(map[int64]int64),
+		unpackedRowid: -1,
+		nextSeq:       1,
+	}
+}
+
+// loadWriterState reads the writer's starting point from the database.
+func (s *Store) loadWriterState() (*writerState, error) {
+	state := newWriterState()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT container_ref, COUNT(*) FROM log_lines GROUP BY container_ref")
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var ref int64
+		var count int
+		if err := rows.Scan(&ref, &count); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		state.hot[ref] = count
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	blocks, err := s.db.QueryContext(ctx,
+		"SELECT container_ref, MAX(ts_max_ns) FROM log_blocks GROUP BY container_ref")
+	if err != nil {
+		return nil, err
+	}
+	for blocks.Next() {
+		var ref, tsMax int64
+		if err := blocks.Scan(&ref, &tsMax); err != nil {
+			blocks.Close()
+			return nil, err
+		}
+		state.sealedMaxTS[ref] = tsMax
+	}
+	blocks.Close()
+	if err := blocks.Err(); err != nil {
+		return nil, err
+	}
+
+	// A reused sequence number would put two different lines at the same keyset
+	// position, so the counter must clear everything either table has ever held.
+	var hotMax, blockMax sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(seq) FROM log_lines").Scan(&hotMax); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT MAX(seq_max) FROM log_blocks").Scan(&blockMax); err != nil {
+		return nil, err
+	}
+	state.nextSeq = max(hotMax.Int64, blockMax.Int64) + 1
+	return state, nil
+}
+
 // writeLoop is the store's single writer. It batches queued messages into one
 // transaction per batchLines rows or batchInterval, whichever comes first, and
 // exits once the queue is closed and drained.
 func (s *Store) writeLoop() {
-	refs := make(map[genKey]int64) // generation -> containers.id
+	state, err := s.loadWriterState()
+	if err != nil {
+		// Starting from a blank slate is not safe: seq would restart at 1 and
+		// collide with stored positions, so refuse to ingest rather than corrupt
+		// the ordering. The store stays readable.
+		log.Printf("logstore: reading writer state failed, ingestion is disabled: %v", err)
+		for range s.ingestCh { //nolint:revive // drain so producers never block
+		}
+		return
+	}
 	batch := make([]ingestMsg, 0, batchLines)
 
 	ticker := time.NewTicker(batchInterval)
@@ -96,7 +195,7 @@ func (s *Store) writeLoop() {
 		if len(batch) == 0 {
 			return
 		}
-		if err := s.commit(batch, refs); err != nil {
+		if err := s.commit(batch, state); err != nil {
 			log.Printf("logstore: write batch failed (%d messages dropped): %v", len(batch), err)
 			// A failed transaction drops the whole batch. Mark every generation it
 			// carried, exactly like the sink's full-queue path: the next sync
@@ -106,6 +205,13 @@ func (s *Store) writeLoop() {
 		}
 		batch = batch[:0]
 		batchesSinceRetain++
+
+		// Sealing is what makes stored history cheap, so it runs on the same
+		// goroutine as ingestion rather than competing with it for the write
+		// lock. A failed seal leaves the lines hot and is retried next batch.
+		if err := s.sealFullBlocks(state); err != nil {
+			log.Printf("logstore: sealing log blocks failed: %v", err)
+		}
 	}
 
 	retain := func() {
@@ -184,9 +290,11 @@ func (s *Store) markBatchGaps(batch []ingestMsg) {
 // INSERT ... RETURNING id hands back a rowid SQLite will hand out again, so
 // caching it eagerly would file the *next* generation's lines against this key
 // — one container's lines landing in another container's timeline.
-func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
+func (s *Store) commit(batch []ingestMsg, state *writerState) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	refs := state.refs
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -198,7 +306,11 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 	// that committed before this transaction began has published its
 	// generations, and the ids it removed leave the cache before they can be
 	// written against.
-	s.dropInvalidated(refs)
+	s.dropInvalidated(state)
+
+	// The cached block belongs to the previous transaction's snapshot; retention
+	// may have deleted it since.
+	state.unpacked, state.unpackedRowid = nil, -1
 
 	// Per-generation aggregates applied once at the end of the transaction.
 	type agg struct {
@@ -208,6 +320,9 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 	}
 	aggs := make(map[int64]*agg)
 	fresh := make(map[genKey]int64) // ids this transaction discovered
+	// newHot counts lines this transaction added, published to the writer's hot
+	// counts only after the commit succeeds.
+	newHot := make(map[int64]int)
 	nowMS := time.Now().UnixMilli()
 	insertedCount := int64(0)
 
@@ -240,7 +355,7 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 			continue
 		}
 
-		inserted, err := insertLine(ctx, tx, ref, msg.line)
+		inserted, err := s.insertLine(ctx, tx, state, ref, msg.line)
 		if err != nil {
 			return err
 		}
@@ -248,6 +363,7 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 			continue
 		}
 		insertedCount++
+		newHot[ref]++
 
 		a := aggs[ref]
 		if a == nil {
@@ -281,9 +397,12 @@ func (s *Store) commit(batch []ingestMsg, refs map[genKey]int64) error {
 	}
 	s.committed.Add(insertedCount)
 
-	// The ids are real only now.
+	// The ids and counts are real only now.
 	for key, ref := range fresh {
 		refs[key] = ref
+	}
+	for ref, count := range newHot {
+		state.hot[ref] += count
 	}
 	return nil
 }
@@ -310,25 +429,35 @@ func upsertGeneration(ctx context.Context, tx *sql.Tx, key genKey, name, project
 	return ref, err
 }
 
-// insertLine stores one line unless an identical (ts_ns, stream, raw) row is
-// already stored for the generation, and reports whether a row was written.
+// insertLine stores one line unless an identical (ts_ns, stream, raw) line is
+// already stored for the generation, hot or sealed, and reports whether a row
+// was written.
 //
 // Every insert is deduplicated, not just backfilled ones: live delivery and a
 // backfill re-read of the same window can reach the writer in either order
 // (the hub buffers records, so a live line can arrive after the backfill that
-// also read it). The check is an index seek on (container_ref, ts_ns), the
-// same B-tree the insert already touches. Note that this never drops a line by
-// timestamp alone — only a byte-identical line on the same stream in the same
-// nanosecond, which is the duplicate we are trying to avoid.
-func insertLine(ctx context.Context, tx *sql.Tx, ref int64, l line) (bool, error) {
+// also read it). Note that this never drops a line by timestamp alone — only a
+// byte-identical line on the same stream in the same nanosecond, which is the
+// duplicate we are trying to avoid.
+func (s *Store) insertLine(ctx context.Context, tx *sql.Tx, state *writerState, ref int64, l line) (bool, error) {
+	sealed, err := s.sealedHasLine(ctx, tx, state, ref, l)
+	if err != nil {
+		return false, err
+	}
+	if sealed {
+		return false, nil
+	}
+
+	// The hot check is an index seek on (container_ref, ts_ns), the same B-tree
+	// the insert already touches.
 	result, err := tx.ExecContext(ctx, `
-		INSERT INTO log_lines (container_ref, ts_ns, stream, level, raw)
-		SELECT ?, ?, ?, ?, ?
+		INSERT INTO log_lines (container_ref, ts_ns, stream, level, raw, seq)
+		SELECT ?, ?, ?, ?, ?, ?
 		WHERE NOT EXISTS (
 			SELECT 1 FROM log_lines
 			WHERE container_ref = ? AND ts_ns = ? AND stream = ? AND raw = ?
 		)`,
-		ref, l.tsNS, l.stream, l.level, l.raw,
+		ref, l.tsNS, l.stream, l.level, l.raw, state.nextSeq,
 		ref, l.tsNS, l.stream, l.raw)
 	if err != nil {
 		return false, err
@@ -337,5 +466,200 @@ func insertLine(ctx context.Context, tx *sql.Tx, ref int64, l line) (bool, error
 	if err != nil {
 		return false, err
 	}
+	if rows > 0 {
+		state.nextSeq++
+	}
 	return rows > 0, nil
+}
+
+// sealedHasLine reports whether a line is already inside one of the
+// generation's sealed blocks.
+//
+// Live ingestion never reaches the database here: its timestamps are newer than
+// anything sealed, which the writer already knows. Only a backfill re-reading a
+// window the store has kept gets this far, and then a block's filter usually
+// rules it out without decompressing.
+func (s *Store) sealedHasLine(ctx context.Context, tx *sql.Tx, state *writerState, ref int64, l line) (bool, error) {
+	if l.tsNS > state.sealedMaxTS[ref] {
+		return false, nil
+	}
+
+	// The payload is deliberately not selected here. This runs once per line of a
+	// backfill re-read, and reading a block's compressed blob is far more
+	// expensive than testing its filter; only the survivors are worth fetching.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT rowid, dedup_filter FROM log_blocks
+		WHERE container_ref = ? AND ts_min_ns <= ? AND ts_max_ns >= ?`,
+		ref, l.tsNS, l.tsNS)
+	if err != nil {
+		return false, err
+	}
+
+	var candidates []int64
+	key := lineKey(l.tsNS, l.stream, l.raw)
+	for rows.Next() {
+		var (
+			rowid  int64
+			filter []byte
+		)
+		if err := rows.Scan(&rowid, &filter); err != nil {
+			rows.Close()
+			return false, err
+		}
+		if !filterMayContain(filter, key) {
+			continue
+		}
+		candidates = append(candidates, rowid)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+
+	for _, rowid := range candidates {
+		lines := state.unpacked
+		if state.unpackedRowid != rowid {
+			var payload []byte
+			if err := tx.QueryRowContext(ctx,
+				"SELECT payload FROM log_blocks WHERE rowid = ?", rowid).Scan(&payload); err != nil {
+				return false, err
+			}
+			var err error
+			lines, state.scratch, err = s.codec.unpack(payload, state.scratch)
+			if err != nil {
+				return false, err
+			}
+			state.unpacked, state.unpackedRowid = lines, rowid
+		}
+		for _, sl := range lines {
+			if sl.tsNS == l.tsNS && sl.stream == l.stream && sl.raw == l.raw {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// sealFullBlocks compresses every complete run of hot lines into a block. It
+// runs between batches on the writer goroutine, so it never competes with
+// ingestion for SQLite's single write lock.
+func (s *Store) sealFullBlocks(state *writerState) error {
+	for ref, count := range state.hot {
+		for count >= blockLines {
+			sealed, err := s.sealOneBlock(ref, state)
+			if err != nil {
+				return err
+			}
+			if sealed == 0 {
+				// The rows are gone (purged, or evicted by retention); trust the
+				// database over the cached count.
+				delete(state.hot, ref)
+				break
+			}
+			count -= sealed
+			state.hot[ref] = count
+		}
+	}
+	return nil
+}
+
+// sealOneBlock moves a generation's oldest blockLines hot lines into a single
+// compressed row, and reports how many lines it sealed.
+//
+// stored_bytes moves with them: the raw bytes leave and the payload arrives, so
+// the retention caps keep measuring what the generation actually occupies.
+func (s *Store) sealOneBlock(ref int64, state *writerState) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT seq, ts_ns, stream, level, raw FROM log_lines
+		WHERE container_ref = ?
+		ORDER BY ts_ns, seq
+		LIMIT ?`, ref, blockLines)
+	if err != nil {
+		return 0, err
+	}
+	lines := make([]sealedLine, 0, blockLines)
+	rawBytes := int64(0)
+	full := false
+	for rows.Next() {
+		var l sealedLine
+		if err := rows.Scan(&l.seq, &l.tsNS, &l.stream, &l.level, &l.raw); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		// A block is also full once it holds enough text, so a container that
+		// logs very long lines cannot build one too large to read back. The
+		// line that would cross the cap starts the next block instead; a single
+		// line larger than the cap still gets a block of its own, and pack
+		// refuses anything the decoder could not read back.
+		if len(lines) > 0 && rawBytes+int64(len(l.raw)) > maxBlockRawBytes {
+			full = true
+			break
+		}
+		lines = append(lines, l)
+		rawBytes += int64(len(l.raw))
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	// A partial run stays hot: sealing it would give up most of the compression,
+	// since a block earns its ratio from the lines it holds together.
+	if !full && len(lines) < blockLines {
+		return 0, nil
+	}
+
+	payload, filter, summary, err := s.codec.pack(lines)
+	if err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO log_blocks
+			(container_ref, ts_min_ns, ts_max_ns, seq_min, seq_max,
+			 lines, level_mask, raw_bytes, dedup_filter, payload)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ref, summary.tsMinNS, summary.tsMaxNS, summary.seqMin, summary.seqMax,
+		summary.lines, summary.levelMask, summary.rawBytes, filter, payload,
+	); err != nil {
+		return 0, err
+	}
+
+	seqs := make([]any, 0, len(lines)+1)
+	for _, l := range lines {
+		seqs = append(seqs, l.seq)
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(seqs)), ",")
+	if _, err := tx.ExecContext(ctx,
+		"DELETE FROM log_lines WHERE container_ref = ? AND seq IN ("+placeholders+")",
+		append([]any{ref}, seqs...)...); err != nil {
+		return 0, err
+	}
+
+	// The filter counts too: eviction frees payload plus filter per block, so
+	// sealing must add exactly that or repeated seal/evict cycles drift
+	// stored_bytes away from what the generation actually occupies.
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE containers
+		SET stored_bytes = max(0, stored_bytes - ? + ?)
+		WHERE id = ?`, summary.rawBytes, int64(len(payload)+len(filter)), ref); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	if summary.tsMaxNS > state.sealedMaxTS[ref] {
+		state.sealedMaxTS[ref] = summary.tsMaxNS
+	}
+	return len(lines), nil
 }

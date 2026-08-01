@@ -1,6 +1,9 @@
 package logstore
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // This file exposes a tiny, read-only measurement surface consumed ONLY by the
 // out-of-tree stress harness (server/cmd/logstore-stress). It adds no behavior
@@ -24,9 +27,15 @@ func (s *Store) Committed() int64 {
 }
 
 // CountLines reports how many log lines are currently retained in the database
-// (i.e. after retention eviction). Stress/measurement use only.
+// (i.e. after retention eviction), counting sealed blocks as well as the hot
+// table. Stress/measurement use only.
 func (s *Store) CountLines(ctx context.Context) (int64, error) {
-	var n int64
-	err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM log_lines").Scan(&n)
-	return n, err
+	var hot, sealed sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, "SELECT count(*) FROM log_lines").Scan(&hot); err != nil {
+		return 0, err
+	}
+	if err := s.db.QueryRowContext(ctx, "SELECT SUM(lines) FROM log_blocks").Scan(&sealed); err != nil {
+		return 0, err
+	}
+	return hot.Int64 + sealed.Int64, nil
 }
