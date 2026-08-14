@@ -144,6 +144,13 @@ export default function RootLayout({
             <Footer />
           </div>
         </ThemeProvider>
+        {process.env.NODE_ENV === 'production' && (
+          <script
+            defer
+            src="https://static.cloudflareinsights.com/beacon.min.js"
+            data-cf-beacon='{"token": "64cf8b0762624db2ae501d86591a04b9"}'
+          />
+        )}
       </body>
     </html>
   );
