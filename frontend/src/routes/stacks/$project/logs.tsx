@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-router";
 import { ArrowLeftIcon } from "lucide-react";
 import { useMemo } from "react";
+import { CalendarToggle } from "@/components/calendar-toggle";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -100,6 +101,7 @@ function StackLogsPage() {
 									: " · no containers found"}
 							</p>
 						</div>
+						<CalendarToggle />
 						<ThemeToggle />
 					</div>
 

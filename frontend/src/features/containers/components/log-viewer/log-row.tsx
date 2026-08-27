@@ -7,9 +7,11 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCalendar } from "@/contexts/calendar-context";
 import type { LogEntry } from "@/features/containers/api/get-container-logs-parsed";
 import { getLogLevelBadgeColor } from "@/features/containers/api/get-container-logs-parsed";
 import { CollapsibleJson } from "@/features/containers/components/collapsible-json";
+import { formatRowTimestamp as formatRowTimestampDisplay } from "@/lib/dates";
 import { isJsonString } from "@/lib/json-format";
 
 // Deterministic per-container badge color for aggregate views.
@@ -32,21 +34,6 @@ function getContainerNameBadgeColor(name: string): string {
 	return CONTAINER_NAME_BADGE_COLORS[
 		Math.abs(hash) % CONTAINER_NAME_BADGE_COLORS.length
 	];
-}
-
-function formatRowTimestamp(timestamp: string | undefined): string {
-	if (!timestamp) return "—";
-	const date = new Date(timestamp);
-	return `${date.toLocaleDateString("en-GB", {
-		day: "2-digit",
-		month: "2-digit",
-		year: "numeric",
-	})} ${date.toLocaleTimeString("en-US", {
-		hour12: false,
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-	})}`;
 }
 
 function rowStateClass(props: LogRowProps): string {
@@ -101,6 +88,7 @@ export interface LogRowProps {
 }
 
 export function LogRow(props: LogRowProps) {
+	const { calendar } = useCalendar();
 	const {
 		entry,
 		index,
@@ -157,7 +145,9 @@ export function LogRow(props: LogRowProps) {
 		>
 			{showTimestamps && (
 				<span className="text-muted-foreground shrink-0 text-[11px]">
-					{formatRowTimestamp(entry.timestamp)}
+					{entry.timestamp
+						? formatRowTimestampDisplay(new Date(entry.timestamp), calendar)
+						: "—"}
 				</span>
 			)}
 			<Badge

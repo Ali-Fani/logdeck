@@ -16,6 +16,7 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCalendar } from "@/contexts/calendar-context";
 
 import type { ContainerInfo } from "../types";
 import {
@@ -46,6 +47,7 @@ export function ContainersLogsSheet({
 	onOpenChange,
 	onContainerRecreated,
 }: ContainersLogsSheetProps) {
+	const { calendar } = useCalendar();
 	const [showLabels, setShowLabels] = useState(false);
 	const [showEnvVariables, setShowEnvVariables] = useState(false);
 	// Kept here (not inside LogViewer) so the sheet's view settings survive
@@ -157,7 +159,7 @@ export function ContainersLogsSheet({
 										<div className="grid grid-cols-3 gap-4">
 											<span className="text-muted-foreground">Created</span>
 											<span className="col-span-2 font-medium">
-												{formatCreatedDate(container.created)}
+												{formatCreatedDate(container.created, calendar)}
 											</span>
 										</div>
 										<div className="grid grid-cols-3 gap-4">

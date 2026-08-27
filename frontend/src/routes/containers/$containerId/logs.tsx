@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-router";
 import { ArrowLeftIcon, TerminalIcon } from "lucide-react";
 import { useRef } from "react";
+import { CalendarToggle } from "@/components/calendar-toggle";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,7 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCalendar } from "@/contexts/calendar-context";
 import {
 	formatContainerName,
 	formatCPUPercent,
@@ -47,6 +49,7 @@ export const Route = createFileRoute("/containers/$containerId/logs")({
 
 function ContainerLogsPage() {
 	const { containerId: encodedContainerId } = Route.useParams();
+	const { calendar } = useCalendar();
 	const navigate = useNavigate();
 	const router = useRouter();
 	const canGoBack = useCanGoBack();
@@ -132,6 +135,7 @@ function ContainerLogsPage() {
 								</div>
 							)}
 						</div>
+						<CalendarToggle />
 						<ThemeToggle />
 					</div>
 
@@ -236,7 +240,7 @@ function ContainerLogsPage() {
 												Created
 											</span>
 											<p className="font-medium">
-												{formatCreatedDate(container.created)}
+												{formatCreatedDate(container.created, calendar)}
 											</p>
 										</div>
 										<div>

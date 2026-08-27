@@ -40,6 +40,8 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { useCalendar } from "@/contexts/calendar-context";
+import { formatDateTime } from "@/lib/dates";
 
 import type { AlertChannel } from "../api/get-alert-channels";
 import type { AlertHistoryEntry } from "../api/get-alert-history";
@@ -646,6 +648,7 @@ function DeliveryStatus({ entry }: { entry: AlertHistoryEntry }) {
 }
 
 function HistoryBlock() {
+	const { calendar } = useCalendar();
 	const { data, isLoading, error } = useAlertHistory(HISTORY_LIMIT);
 	const clearMutation = useClearAlertHistory();
 	const [isClearOpen, setIsClearOpen] = useState(false);
@@ -700,7 +703,7 @@ function HistoryBlock() {
 							{alerts.map((entry) => (
 								<TableRow key={entry.id}>
 									<TableCell className="text-xs text-muted-foreground whitespace-nowrap">
-										{new Date(entry.firedAt).toLocaleString()}
+										{formatDateTime(new Date(entry.firedAt), calendar)}
 									</TableCell>
 									<TableCell className="font-medium">
 										{entry.ruleName}

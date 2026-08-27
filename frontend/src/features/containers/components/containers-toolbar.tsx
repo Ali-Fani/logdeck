@@ -8,6 +8,7 @@ import {
 	XIcon,
 } from "lucide-react";
 import type { DateRange } from "react-day-picker";
+import { CalendarToggle } from "@/components/calendar-toggle";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
@@ -30,6 +31,8 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useAuth } from "@/contexts/auth-context";
+import { useCalendar } from "@/contexts/calendar-context";
+import { formatMonthDay } from "@/lib/dates";
 import type { DockerHost } from "../types";
 import type { GroupByOption, SortDirection } from "./container-utils";
 import { toTitleCase } from "./container-utils";
@@ -74,6 +77,7 @@ export function ContainersToolbar({
 	isFetching,
 }: ContainersToolbarProps) {
 	const { logout, user, isAuthEnabled } = useAuth();
+	const { calendar } = useCalendar();
 	const navigate = useNavigate();
 
 	const handleLogout = () => {
@@ -87,14 +91,8 @@ export function ContainersToolbar({
 		}
 
 		if (dateRange.to) {
-			const from = dateRange.from.toLocaleDateString("en-US", {
-				month: "short",
-				day: "numeric",
-			});
-			const to = dateRange.to.toLocaleDateString("en-US", {
-				month: "short",
-				day: "numeric",
-			});
+			const from = formatMonthDay(dateRange.from, calendar);
+			const to = formatMonthDay(dateRange.to, calendar);
 			return (
 				<>
 					{from} - {to}
@@ -102,10 +100,7 @@ export function ContainersToolbar({
 			);
 		}
 
-		return dateRange.from.toLocaleDateString("en-US", {
-			month: "short",
-			day: "numeric",
-		});
+		return formatMonthDay(dateRange.from, calendar);
 	};
 
 	return (
@@ -265,6 +260,7 @@ export function ContainersToolbar({
 					<TooltipContent>Settings</TooltipContent>
 				</Tooltip>
 
+				<CalendarToggle />
 				<ThemeToggle />
 
 				{isAuthEnabled && (

@@ -1,4 +1,3 @@
-import { format } from "date-fns";
 import { ClockIcon } from "lucide-react";
 import { useId, useState } from "react";
 import type { DateRange } from "react-day-picker";
@@ -19,6 +18,11 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
+import {
+	type CalendarPreference,
+	useCalendar,
+} from "@/contexts/calendar-context";
+import { formatMonthDayTime, formatTime } from "@/lib/dates";
 import {
 	TIME_RANGE_PRESET_LABELS,
 	TIME_RANGE_PRESETS,
@@ -45,13 +49,16 @@ function toTimeValue(iso: string | null, fallback: string): string {
 	if (!iso) return fallback;
 	const date = new Date(iso);
 	if (Number.isNaN(date.getTime())) return fallback;
-	return format(date, "HH:mm");
+	return formatTime(date);
 }
 
-function customRangeLabel(timeRange: TimeRange): string {
+function customRangeLabel(
+	timeRange: TimeRange,
+	calendar: CalendarPreference,
+): string {
 	if (!timeRange.since && !timeRange.until) return "Pick range";
 	const fmt = (iso: string | null) =>
-		iso ? format(new Date(iso), "MMM d, HH:mm") : "now";
+		iso ? formatMonthDayTime(new Date(iso), calendar) : "now";
 	if (!timeRange.since) return `Until ${fmt(timeRange.until)}`;
 	return `${fmt(timeRange.since)} – ${fmt(timeRange.until)}`;
 }
@@ -61,6 +68,7 @@ export function TimeRangeControl({
 	setTimeRange,
 	disabled = false,
 }: TimeRangeControlProps) {
+	const { calendar } = useCalendar();
 	const [isCustomOpen, setIsCustomOpen] = useState(false);
 	const [draftRange, setDraftRange] = useState<DateRange | undefined>();
 	const [sinceTime, setSinceTime] = useState("00:00");
@@ -129,7 +137,7 @@ export function TimeRangeControl({
 							onClick={openCustomEditor}
 							className="h-8 text-xs"
 						>
-							{customRangeLabel(timeRange)}
+							{customRangeLabel(timeRange, calendar)}
 						</Button>
 					</PopoverTrigger>
 					<PopoverContent align="start" className="w-auto p-3">

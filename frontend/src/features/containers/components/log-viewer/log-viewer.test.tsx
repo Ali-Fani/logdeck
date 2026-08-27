@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
+import { CalendarProvider } from "@/contexts/calendar-context";
 import type { LogEntry } from "@/features/containers/api/get-container-logs-parsed";
 import type {
 	HistoryLogsPage,
@@ -131,14 +131,16 @@ function Harness() {
 			}),
 	);
 	return (
-		<QueryClientProvider client={queryClient}>
-			<LogViewer
-				variant="page"
-				containerId="container-1"
-				host="host-1"
-				viewState={viewState}
-			/>
-		</QueryClientProvider>
+		<CalendarProvider>
+			<QueryClientProvider client={queryClient}>
+				<LogViewer
+					variant="page"
+					containerId="container-1"
+					host="host-1"
+					viewState={viewState}
+				/>
+			</QueryClientProvider>
+		</CalendarProvider>
 	);
 }
 
