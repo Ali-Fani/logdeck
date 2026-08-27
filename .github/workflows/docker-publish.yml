@@ -21,14 +21,14 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: amoabakelvin
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: amoabakelvin/logdeck
+          images: ${{ vars.DOCKERHUB_USERNAME }}/logdeck
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}

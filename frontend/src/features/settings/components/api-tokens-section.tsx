@@ -39,6 +39,8 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { useCalendar } from "@/contexts/calendar-context";
+import { formatDate } from "@/lib/dates";
 
 import {
 	useApiTokens,
@@ -49,6 +51,7 @@ import type { APIToken, APITokenScope, CreatedAPIToken } from "../types";
 import { showResultToast } from "./mutation-toast";
 
 export function ApiTokensSection() {
+	const { calendar } = useCalendar();
 	const { data, isLoading, error } = useApiTokens();
 	const createMutation = useCreateApiToken();
 	const deleteMutation = useDeleteApiToken();
@@ -185,7 +188,7 @@ export function ApiTokensSection() {
 										</Badge>
 									</TableCell>
 									<TableCell className="text-xs text-muted-foreground">
-										{new Date(t.createdAt).toLocaleDateString()}
+										{formatDate(new Date(t.createdAt), calendar)}
 									</TableCell>
 									<TableCell className="text-right">
 										<Button

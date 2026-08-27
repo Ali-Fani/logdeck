@@ -23,6 +23,10 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import {
+	type CalendarPreference,
+	useCalendar,
+} from "@/contexts/calendar-context";
+import {
 	formatBytes,
 	sortStoredContainersBySize,
 } from "@/features/containers/components/container-utils";
@@ -31,6 +35,7 @@ import { PurgeHistoryDialog } from "@/features/containers/components/purge-histo
 import { useDeleteHistoryContainer } from "@/features/containers/hooks/use-delete-history-container";
 import { useHistoryContainers } from "@/features/containers/hooks/use-history-containers";
 import { useHistoryStatus } from "@/features/containers/hooks/use-history-status";
+import { formatMonthDay } from "@/lib/dates";
 
 import type { UpdateLogStoragePayload } from "../api/update-log-storage";
 import { useUpdateLogStorage } from "../hooks/use-settings";
@@ -44,16 +49,17 @@ const MB = 1024 * 1024;
 
 // A container with nothing stored has zero timestamps, which would otherwise
 // render as a 1970-era date.
-function formatSpan(oldest: string, newest: string, storedBytes: number) {
+function formatSpan(
+	oldest: string,
+	newest: string,
+	storedBytes: number,
+	calendar: CalendarPreference,
+) {
 	const from = Date.parse(oldest);
 	const to = Date.parse(newest);
 	if (storedBytes <= 0 || Number.isNaN(from) || Number.isNaN(to)) return "—";
 
-	const format = (value: number) =>
-		new Date(value).toLocaleDateString(undefined, {
-			month: "short",
-			day: "numeric",
-		});
+	const format = (value: number) => formatMonthDay(new Date(value), calendar);
 	return `${format(from)} → ${format(to)}`;
 }
 
@@ -136,6 +142,7 @@ interface LogStorageSectionProps {
 }
 
 export function LogStorageSection({ config }: LogStorageSectionProps) {
+	const { calendar } = useCalendar();
 	const { data: status } = useHistoryStatus();
 	const isEnabled = status?.enabled === true;
 	const {
@@ -268,12 +275,13 @@ export function LogStorageSection({ config }: LogStorageSectionProps) {
 									</TableCell>
 									<TableCell className="font-mono text-xs">
 										{formatBytes(container.storedBytes)}
-									</TableCell>
+									</TableCell>{" "}
 									<TableCell className="whitespace-nowrap text-xs text-muted-foreground">
 										{formatSpan(
 											container.oldestTs,
 											container.newestTs,
 											container.storedBytes,
+											calendar,
 										)}
 									</TableCell>
 									<TableCell className="text-right">

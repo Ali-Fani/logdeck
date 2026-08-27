@@ -26,6 +26,7 @@ import {
 	TooltipProvider,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useCalendar } from "@/contexts/calendar-context";
 import type { ComposeAction } from "../api/compose-actions";
 import type { StatsHistoryMap } from "../hooks/use-stats-history";
 import type { ContainerInfo, ContainerStatsMap } from "../types";
@@ -148,6 +149,8 @@ export function ContainersTable({
 	onPurgeHistory,
 	onRetry,
 }: ContainersTableProps) {
+	const { calendar } = useCalendar();
+
 	const isPending = (action: ContainerActionType, id: string) =>
 		pendingActions.get(id) === action;
 
@@ -253,7 +256,7 @@ export function ContainersTable({
 					{container.status || "—"}
 				</TableCell>
 				<TableCell className="h-16 px-4 text-sm text-muted-foreground">
-					{formatCreatedDate(container.created)}
+					{formatCreatedDate(container.created, calendar)}
 				</TableCell>
 				<TableCell className="h-16 px-4">
 					<TooltipProvider>
