@@ -67,6 +67,11 @@ See the [Log History guide](https://logdeck.dev/docs/log-history).
 
 See the [Alerting guide](https://logdeck.dev/docs/alerting).
 
+### Interface & Localization
+
+- Gregorian or **Jalali (Persian) calendar** for every date in the UI: pick one from the calendar toggle next to the theme switcher. Date pickers (single and range), table timestamps, log rows, and settings all follow, and your choice is remembered per browser.
+- Dates always render in your local timezone, so filtering and URLs stay correct no matter which calendar you're reading.
+
 ### Multi-Host, Docker & Podman
 
 - Connect to local Unix sockets, remote SSH (key auth), or TCP endpoints; filter and view by host or across all hosts, with real-time state sync
